@@ -354,7 +354,12 @@ impl VmmController {
 
         let t0 = Instant::now();
         let mem_size = config.memory.size_bytes()?;
-        let mem = GuestMemory::new(mem_size).map_err(|e| VmmError::Memory(e.to_string()))?;
+        let mem = GuestMemory::new_with_mmio_hole(
+            mem_size,
+            vmm_loader::MMIO_GAP_START,
+            vmm_loader::MMIO_GAP_END,
+        )
+        .map_err(|e| VmmError::Memory(e.to_string()))?;
         let t_mem = t0.elapsed();
 
         let t1 = Instant::now();
@@ -407,6 +412,20 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM (boot first)".into()))?;
+
+        // The dump below reads the whole guest image through
+        // `GuestMemory::as_ptr()`, which only ever points at the first of a
+        // split guest-memory's regions (see its doc comment) — reject
+        // explicitly rather than silently truncating the dump to that first
+        // region while claiming `size_bytes` (the full, unsplit total) was
+        // captured.
+        if let Some(g) = vm.guest_mem.as_ref() {
+            if g.is_split() {
+                return Err(VmmError::Snapshot(
+                    "snapshot of a VM with memory split across the device MMIO window is not yet supported".into(),
+                ));
+            }
+        }
 
         let path_buf = unique_scratch_snapshot_path("vmm-snap")?;
         let path = path_buf.to_string_lossy().into_owned();
@@ -567,7 +586,12 @@ impl VmmController {
         }
 
         let mem_size = config.memory.size_bytes()?;
-        let mem = GuestMemory::new(mem_size).map_err(|e| VmmError::Memory(e.to_string()))?;
+        let mem = GuestMemory::new_with_mmio_hole(
+            mem_size,
+            vmm_loader::MMIO_GAP_START,
+            vmm_loader::MMIO_GAP_END,
+        )
+        .map_err(|e| VmmError::Memory(e.to_string()))?;
         let cmdline = if config.kernel.cmdline.is_empty() {
             vmm_loader::default_cmdline()
         } else {
@@ -1430,7 +1454,12 @@ impl VmmController {
         std::env::set_var("VMM_BOOT_TIMEOUT", timeout_secs.to_string());
 
         let mem_size = config.memory.size_bytes()?;
-        let mem = GuestMemory::new(mem_size).map_err(|e| VmmError::Memory(e.to_string()))?;
+        let mem = GuestMemory::new_with_mmio_hole(
+            mem_size,
+            vmm_loader::MMIO_GAP_START,
+            vmm_loader::MMIO_GAP_END,
+        )
+        .map_err(|e| VmmError::Memory(e.to_string()))?;
         let mut cmdline = if config.kernel.cmdline.is_empty() {
             vmm_loader::default_cmdline()
         } else {
@@ -1660,6 +1689,13 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
             .guest_mem
             .as_ref()
             .ok_or_else(|| VmmError::Memory("no guest memory to suspend".into()))?;
+        // See the matching check in `snapshot()`: `as_ptr()` only covers a
+        // split guest-memory's first region.
+        if guest_mem.is_split() {
+            return Err(VmmError::Memory(
+                "suspend of a VM with memory split across the device MMIO window is not yet supported".into(),
+            ));
+        }
         let mem_ptr = guest_mem.as_ptr() as *mut u8;
         let mem_len: usize = guest_mem
             .size_bytes
@@ -2777,6 +2813,19 @@ fn try_lazy_restore_full_snapshot(path: &str) -> Result<Option<RestoredSnapshot>
         )));
     }
 
+    // `GuestMemory::as_ptr()` (used just below via `start_lazy_restore`)
+    // only ever points at the first of a split guest-memory's regions — a
+    // snapshot whose `mem_len` reaches the device MMIO window would need a
+    // matching lazy-restore path aware of two discontiguous regions, which
+    // doesn't exist yet. Reject explicitly rather than silently reading/
+    // writing past the first mapping.
+    if layout.mem_len > vmm_loader::MMIO_GAP_START {
+        return Err(VmmError::Snapshot(format!(
+            "{path}: lazy restore of snapshots with mem_len 0x{:x} > 0x{:x} not yet supported (would need a split guest-memory region)",
+            layout.mem_len,
+            vmm_loader::MMIO_GAP_START
+        )));
+    }
     let mem = vmm_memory_backend::GuestMemory::new(layout.mem_len)
         .map_err(|e| VmmError::Memory(e.to_string()))?;
     let lazy_restore = vmm_memory_backend::start_lazy_restore(
@@ -2935,6 +2984,17 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
             return Err(VmmError::Snapshot(format!(
                 "memory CRC mismatch in {path_display}: got {actual_mem_crc:#010x}, expected {:#010x}",
                 header.mem_crc
+            )));
+        }
+        // `mem.as_ptr()` below only ever points at the first of a split
+        // guest-memory's regions — a snapshot whose `mem_len` reaches the
+        // device MMIO window would silently read/write past that first
+        // mapping, so reject it explicitly instead.
+        if layout.mem_len > vmm_loader::MMIO_GAP_START {
+            return Err(VmmError::Snapshot(format!(
+                "{path_display}: restoring snapshots with mem_len 0x{:x} > 0x{:x} not yet supported (would need a split guest-memory region)",
+                layout.mem_len,
+                vmm_loader::MMIO_GAP_START
             )));
         }
         let mem = vmm_memory_backend::GuestMemory::new(layout.mem_len)
@@ -3514,7 +3574,13 @@ fn build_running_vm(
 /// Build the virtio device list (block + net) shared by `create_live` and
 /// `build_running_vm`, at a single deterministic MMIO/IRQ/ACPI layout so the
 /// two paths cannot drift. Block devices come first at GSI 5.., then net at
-/// GSI 5+volumes.len().., each at MMIO base 0xd000_0000 + slot*0x1000.
+/// GSI 5+volumes.len().., each at MMIO base `vmm_loader::MMIO_GAP_START +
+/// slot*0x1000` — fixed, not derived from guest RAM size (ACPI's
+/// `Memory32Fixed` resource descriptor is 32-bit only, so this can never
+/// move up to make room for a bigger VM). Guest RAM that would otherwise
+/// reach this window is relocated above `vmm_loader::MMIO_GAP_END` instead
+/// — see `GuestMemory::new_with_mmio_hole`, called with the same two
+/// constants when this VM's memory was built.
 ///
 /// Returns the boxed devices (for `KvmVm::new_with_options`), the ACPI DSDT
 /// entries (base,len,gsi) create_live bakes into guest memory, the per-volume
@@ -3570,7 +3636,16 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     use vmm_devices::virtio::rng::VirtioRng;
     use vmm_devices::virtio::rng_transport::VirtioRngMmio;
 
-    const MMIO_START: u64 = 0xd000_0000;
+    // Fixed, not derived from `mem.size_bytes`: ACPI's `Memory32Fixed`
+    // resource descriptor (used below to tell the guest where each device
+    // lives) is a 32-bit field, so this can never move up to make room for
+    // a bigger VM. Guest RAM that would otherwise reach into this window is
+    // relocated above `MMIO_GAP_END` instead — see `GuestMemory::
+    // new_with_mmio_hole`, called with these same two constants when this
+    // VM's memory was built (`create_live`/`build_running_vm`), and
+    // `vmm_loader::build_e820_map`, which reserves the identical range so
+    // the guest never mistakes it for RAM.
+    let mmio_start = vmm_loader::MMIO_GAP_START;
     let gm = mem.inner.clone();
     let host_dirty = mem.host_dirty_tracker();
     let mut devices: Vec<(MmioRange, Box<dyn MmioDevice>)> = Vec::new();
@@ -3581,7 +3656,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
 
     for (i, vol) in config.volumes.iter().enumerate() {
         let irq = 5 + i as u32;
-        let mmio_base = MMIO_START + (i as u64) * 0x1000;
+        let mmio_base = mmio_start + (i as u64) * 0x1000;
         let backend = crate::volume::open_volume_backend(vol)
             .map_err(|e| VmmError::Device(format!("blk backend {}: {e}", vol.path)))?;
         let transport = Arc::new(VirtioBlkMmio::new(irq, backend));
@@ -3609,7 +3684,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     for (j, net) in config.net.iter().enumerate() {
         let slot = config.volumes.len() + j;
         let irq = 5 + slot as u32;
-        let mmio_base = MMIO_START + (slot as u64) * 0x1000;
+        let mmio_base = mmio_start + (slot as u64) * 0x1000;
         let mac = parse_guest_mac(net.guest_mac.as_deref(), j);
         let tap = vmm_net::tap::Tap::create(&net.tap)
             .map_err(|e| VmmError::Device(format!("tap {}: {e}", net.tap)))?;
@@ -3650,7 +3725,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     // entropy via getrandom (openat was killing the vCPU under seccomp).
     let rng_slot = config.volumes.len() + config.net.len();
     let rng_irq_num = 5 + rng_slot as u32;
-    let rng_mmio = MMIO_START + (rng_slot as u64) * 0x1000;
+    let rng_mmio = mmio_start + (rng_slot as u64) * 0x1000;
     let rng_dev = VirtioRngMmio::new(rng_irq_num, VirtioRng::new());
     rng_dev.set_guest_memory(gm.clone());
     rng_dev.set_guest_dirty_tracker(host_dirty.clone());
@@ -3673,7 +3748,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     const VSOCK_GUEST_CID: u64 = 3;
     let vsock_slot = rng_slot + 1;
     let vsock_irq = 5 + vsock_slot as u32;
-    let vsock_mmio = MMIO_START + (vsock_slot as u64) * 0x1000;
+    let vsock_mmio = mmio_start + (vsock_slot as u64) * 0x1000;
     let control_socket = unique_runtime_file_path("vmm-vsock", "sock")?;
     let _ = std::fs::remove_file(&control_socket);
     let vsock_dev = Arc::new(VirtioVsockMmio::new(vsock_irq, VSOCK_GUEST_CID));

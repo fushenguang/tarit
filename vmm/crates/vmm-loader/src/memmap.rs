@@ -4,16 +4,32 @@
 //! tests) compile and run on any host. The actual `boot_params` struct
 //! wiring lives in [`crate::x86_64`] and is `target_arch = "x86_64"`-gated.
 //!
-//! Layout (the standard x86_64 microVM memory map, as in rust-vmm's
-//! vmm-reference):
+//! Layout:
 //!
 //! | GPA range | Type | Purpose |
 //! |---|---|---|
 //! | `0x0`..`0xA_0000` | RAM | low memory (640 KiB) |
 //! | `0xA_0000`..`0x10_0000` | reserved | legacy VGA + BIOS data (384 KiB) |
-//! | `0x10_0000`..`0x_1000_0000` | RAM | high memory before the MMIO gap |
-//! | `0x_1000_0000`..`0x_8000_0000` | reserved | the MMIO gap (virtio-mmio devices) |
-//! | `0x_8000_0000`..`mem_end` | RAM | high memory after the gap |
+//! | `0x10_0000`..`MMIO_GAP_START` | RAM | high memory before the device window |
+//! | `MMIO_GAP_START`..`MMIO_GAP_END` | reserved | device MMIO window (virtio-mmio) |
+//! | `MMIO_GAP_END`..`mem_end` | RAM | any RAM beyond the window, relocated here |
+//!
+//! `vmm-core::controller::build_devices` places every virtio-mmio device
+//! inside `[MMIO_GAP_START, MMIO_GAP_END)` and nowhere else — that address
+//! is fixed, not derived from `mem_size_bytes`, because ACPI's
+//! `Memory32Fixed` resource descriptor (used to tell the guest where each
+//! device lives) is a 32-bit field and can't address anything at or past
+//! 4 GiB (`MMIO_GAP_END`). So instead of moving the device window for large
+//! VMs, guest RAM that would otherwise reach into the window is relocated
+//! to resume at `MMIO_GAP_END` — the same "memory hole" trick real x86
+//! firmware performs above the low 4 GiB. No requested RAM is lost, it just
+//! isn't contiguous once `mem_size_bytes > MMIO_GAP_START`.
+//!
+//! `vmm-memory-backend::GuestMemory::new_with_mmio_hole` (called with these
+//! same two constants from `vmm-core::controller`) does the matching split
+//! of the actual `KVM_SET_USER_MEMORY_REGION` backing — the E820 map here
+//! and the real memory layout there must always agree, which is why both
+//! read from this one module.
 
 // --- x86_64 boot / E820 constants (from kernel Documentation/x86/boot.txt) --
 
@@ -41,10 +57,13 @@ pub const E820_RESERVED: u32 = 2;
 pub const ZERO_PAGE_ADDR: u64 = 0x0001_0000;
 /// High-memory start — the kernel is loaded just above this.
 pub const HIMEM_START: u64 = 0x0010_0000; // 1 MiB
-/// Start of the MMIO gap.
-pub const MMIO_GAP_START: u64 = 0x_1000_0000; // 256 MiB
-/// End of the MMIO gap.
-pub const MMIO_GAP_END: u64 = 0x_8000_0000; // 2 GiB
+/// Start of the device MMIO window — fixed, never moves. See the module docs
+/// for why (ACPI `Memory32Fixed` is 32-bit only).
+pub const MMIO_GAP_START: u64 = 0x_D000_0000; // 3.25 GiB
+/// End of the device MMIO window / where relocated high memory resumes.
+/// Must stay at or below `u32::MAX + 1` — anything the device window itself
+/// needs must fit in `[MMIO_GAP_START, MMIO_GAP_END)`.
+pub const MMIO_GAP_END: u64 = 0x1_0000_0000; // 4 GiB
 
 // --- E820 map construction -------------------------------------------------
 
@@ -58,10 +77,14 @@ pub struct E820Entry {
 
 /// Build the E820 map for a guest with `mem_size_bytes` of RAM.
 ///
-/// See the module docs for the layout. For small VMs whose RAM ends before
-/// the MMIO gap, only the first three entries are emitted.
+/// See the module docs for the layout. For `mem_size_bytes <= MMIO_GAP_START`
+/// (the common case — every VM this project ran before this fix), this is
+/// unchanged from before: low, reserved, then one high-RAM entry running to
+/// `mem_size_bytes`. Only requests that would reach into the device window
+/// get a reserved gap entry plus a second high-RAM entry picking back up at
+/// `MMIO_GAP_END`.
 pub fn build_e820_map(mem_size_bytes: u64) -> Vec<E820Entry> {
-    let mut entries = Vec::with_capacity(5);
+    let mut entries = Vec::with_capacity(4);
 
     // 1. Low memory 0..0xA_0000 (640 KiB).
     entries.push(E820Entry {
@@ -77,36 +100,33 @@ pub fn build_e820_map(mem_size_bytes: u64) -> Vec<E820Entry> {
         mem_type: E820_RESERVED,
     });
 
-    // 3. High memory from HIMEM_START up to the MMIO gap (if RAM reaches it).
+    // 3. High memory from HIMEM_START up to the device window (or to the
+    // end of RAM, if RAM doesn't reach that far).
     if mem_size_bytes > HIMEM_START {
-        let high_before_gap_end = mem_size_bytes.min(MMIO_GAP_START);
+        let high_end = mem_size_bytes.min(MMIO_GAP_START);
         entries.push(E820Entry {
             addr: HIMEM_START,
-            size: high_before_gap_end - HIMEM_START,
+            size: high_end - HIMEM_START,
             mem_type: E820_RAM,
         });
     }
 
-    // 4. The MMIO gap (reserved). Emitted when RAM extends into the gap.
-    // The gap entry spans only up to min(mem_size, MMIO_GAP_END) so the
-    // E820 map stays contiguous and totals exactly to mem_size. When RAM
-    // ends inside the gap, the gap "eats" the upper part of RAM (the kernel
-    // sees less usable RAM than mem_size — that's the MMIO-hole model).
+    // 4. The device window itself (reserved) + 5. any RAM relocated above
+    // it. Both are only emitted when RAM actually reaches the window —
+    // otherwise the guest never sees these addresses at all, which is fine:
+    // nothing needs to claim address space nothing will ever touch.
     if mem_size_bytes > MMIO_GAP_START {
-        let gap_end_in_ram = mem_size_bytes.min(MMIO_GAP_END);
         entries.push(E820Entry {
             addr: MMIO_GAP_START,
-            size: gap_end_in_ram - MMIO_GAP_START,
+            size: MMIO_GAP_END - MMIO_GAP_START,
             mem_type: E820_RESERVED,
         });
-    }
-
-    // 5. High memory after the gap, up to the end of RAM. Only when RAM
-    // extends past the gap.
-    if mem_size_bytes > MMIO_GAP_END {
         entries.push(E820Entry {
             addr: MMIO_GAP_END,
-            size: mem_size_bytes - MMIO_GAP_END,
+            // Relocated size is the full remainder past MMIO_GAP_START, not
+            // past MMIO_GAP_END — nothing requested is dropped, it's all
+            // still here, just moved: total RAM == mem_size_bytes exactly.
+            size: mem_size_bytes - MMIO_GAP_START,
             mem_type: E820_RAM,
         });
     }
@@ -120,7 +140,8 @@ mod tests {
 
     #[test]
     fn e820_map_layout_small_16mib() {
-        // 16 MiB RAM: low, reserved, high-before-gap. The gap is past the end.
+        // 16 MiB RAM: unchanged from the pre-fix shape — low, reserved,
+        // high — the device window is nowhere near this size.
         let m = build_e820_map(16 * 1024 * 1024);
         assert_eq!(m.len(), 3);
         assert_eq!(m[0].addr, 0);
@@ -141,64 +162,112 @@ mod tests {
     }
 
     #[test]
-    fn e820_map_layout_large_4gib() {
-        // 4 GiB RAM: all 5 entries, including the post-gap high memory.
-        let m = build_e820_map(4 * 1024 * 1024 * 1024);
+    fn e820_map_layout_exactly_at_gap_start_has_no_relocation() {
+        // RAM ends exactly where the device window begins: no overlap, so
+        // no gap/relocation entries are needed at all.
+        let m = build_e820_map(MMIO_GAP_START);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[2].addr, HIMEM_START);
+        assert_eq!(m[2].size, MMIO_GAP_START - HIMEM_START);
+    }
+
+    #[test]
+    fn e820_map_layout_past_gap_relocates_the_remainder() {
+        // 512 MiB of RAM past the device window: low, reserved, high (up to
+        // the window), the window itself (reserved), then the relocated
+        // remainder starting at MMIO_GAP_END.
+        let requested = MMIO_GAP_START + 512 * 1024 * 1024;
+        let m = build_e820_map(requested);
+        assert_eq!(m.len(), 5);
+        assert_eq!(m[2].addr, HIMEM_START);
+        assert_eq!(m[2].size, MMIO_GAP_START - HIMEM_START);
+        assert_eq!(m[3].addr, MMIO_GAP_START);
+        assert_eq!(m[3].size, MMIO_GAP_END - MMIO_GAP_START);
+        assert_eq!(m[3].mem_type, E820_RESERVED);
+        assert_eq!(m[4].addr, MMIO_GAP_END);
+        assert_eq!(m[4].size, 512 * 1024 * 1024);
+        assert_eq!(m[4].mem_type, E820_RAM);
+    }
+
+    #[test]
+    fn e820_map_layout_large_8gib() {
+        // 8 GiB RAM: same five-entry shape, just a bigger relocated tail.
+        let requested = 8 * 1024 * 1024 * 1024u64;
+        let m = build_e820_map(requested);
         assert_eq!(m.len(), 5);
         let last = m[4];
         assert_eq!(last.addr, MMIO_GAP_END);
-        assert_eq!(last.size, 4 * 1024 * 1024 * 1024 - MMIO_GAP_END);
+        assert_eq!(last.size, requested - MMIO_GAP_START);
         assert_eq!(last.mem_type, E820_RAM);
     }
 
     #[test]
-    fn e820_map_layout_1gib_ram_ends_inside_gap() {
-        // 1 GiB RAM is below MMIO_GAP_END (2 GiB), so there's no post-gap
-        // entry — the gap itself is the last entry, and it spans from
-        // MMIO_GAP_START up to the end of RAM (not the full gap).
-        let m = build_e820_map(1024 * 1024 * 1024);
-        assert_eq!(m.len(), 4);
-        assert_eq!(m[3].addr, MMIO_GAP_START);
-        assert_eq!(m[3].mem_type, E820_RESERVED);
-        assert_eq!(
-            m[3].size,
-            1024 * 1024 * 1024 - MMIO_GAP_START,
-            "gap should span only up to end of RAM"
-        );
-    }
-
-    #[test]
-    fn e820_ram_and_reserved_sum_to_mem_size() {
-        // The total of all E820 entries (RAM + reserved) must equal mem_size.
-        // We require mem_size >= HIMEM_START (1 MiB) — a real VMM never boots
-        // with sub-megabyte RAM. Sizes at and above the gap are the
-        // interesting boundary cases.
+    fn e820_ram_total_equals_mem_size_even_when_split() {
+        // Only the RAM entries (not the reserved device window) must sum to
+        // mem_size_bytes, minus the fixed 384 KiB VGA/BIOS carve-out that
+        // every request pays regardless of size (0xA_0000..0x10_0000, always
+        // reserved — a pre-existing, unrelated quirk of the low 1 MiB, same
+        // before and after this fix). That leftover constant offset is the
+        // whole point being tested here: past that, no *additional* capacity
+        // is lost to the (much bigger) device window, however large the
+        // request — it's all relocated, not discarded.
+        const VGA_RESERVED: u64 = 0x10_0000 - 0xA_0000;
         for &sz in &[
-            HIMEM_START,             // exactly 1 MiB (low + reserved, no high)
-            16 * 1024 * 1024,        // before gap
-            MMIO_GAP_START,          // exactly at gap start
-            MMIO_GAP_START + 0x1000, // just into gap
-            MMIO_GAP_END,            // exactly at gap end
-            256 * 1024 * 1024,       // after gap
-            1024 * 1024 * 1024,      // 1 GiB (ends inside gap)
-            4 * 1024 * 1024 * 1024,  // 4 GiB (past gap)
+            16 * 1024 * 1024,
+            256 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            MMIO_GAP_START,
+            MMIO_GAP_START + 1, // just past the window's start
+            4 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
         ] {
             let m = build_e820_map(sz);
-            let total: u64 = m.iter().map(|e| e.size).sum();
-            assert_eq!(total, sz, "size 0x{sz:x}");
+            let ram_total: u64 = m
+                .iter()
+                .filter(|e| e.mem_type == E820_RAM)
+                .map(|e| e.size)
+                .sum();
+            assert_eq!(ram_total, sz - VGA_RESERVED, "size 0x{sz:x}");
         }
     }
 
     #[test]
     fn e820_entries_are_contiguous_and_non_overlapping() {
-        // Walk the entries; each must start where the previous ended.
-        for &sz in &[16 * 1024 * 1024, 256 * 1024 * 1024, 1024 * 1024 * 1024] {
+        // Walk the entries; each must start where the previous ended — this
+        // still holds with the gap, since the gap is itself an entry.
+        for &sz in &[
+            16 * 1024 * 1024,
+            256 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            MMIO_GAP_START + 512 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        ] {
             let m = build_e820_map(sz);
             for w in m.windows(2) {
                 assert_eq!(w[0].addr + w[0].size, w[1].addr, "size 0x{sz:x}");
             }
             assert_eq!(m[0].addr, 0);
-            assert_eq!(m.last().unwrap().addr + m.last().unwrap().size, sz);
+        }
+    }
+
+    #[test]
+    fn gap_entry_never_marked_ram() {
+        // However large the request, the device window itself must never
+        // be claimed as RAM — that's the exact bug this module used to have
+        // (with the wrong window address), and the one this fix must never
+        // reintroduce.
+        for &sz in &[
+            MMIO_GAP_START + 1,
+            4 * 1024 * 1024 * 1024,
+            8 * 1024 * 1024 * 1024,
+        ] {
+            let m = build_e820_map(sz);
+            for e in &m {
+                let overlaps_window = e.addr < MMIO_GAP_END && e.addr + e.size > MMIO_GAP_START;
+                if overlaps_window {
+                    assert_eq!(e.mem_type, E820_RESERVED, "size 0x{sz:x}");
+                }
+            }
         }
     }
 }

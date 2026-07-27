@@ -15,11 +15,25 @@ pub enum MemoryError {
     OutOfBounds(u64, u64),
 }
 
-/// A flat guest physical address space backed by one or more mmap'd regions.
+/// A guest physical address space backed by one or two mmap'd regions.
 ///
-/// v1 uses a single contiguous region starting at GPA 0 — the minimal case.
-/// VMMs with PCI support use multiple regions to work around the
-/// x86_64 PCI hole; we add that when (if) we add PCI, which v1 does not.
+/// Below `MMIO_GAP_START` (see `vmm_loader::memmap`, not imported here to
+/// keep this crate dependency-free — callers pass the gap explicitly), this
+/// is a single contiguous region starting at GPA 0, same as always. For a
+/// `size_bytes` that would otherwise reach into the fixed low device MMIO
+/// window (`vmm-core::controller::build_devices` places devices there,
+/// always below 4 GiB — ACPI's `Memory32Fixed` descriptor is 32-bit only, so
+/// that placement can never move up to make room), the constructor instead
+/// builds two regions: `[0, gap_start)` unchanged, and the remainder
+/// relocated to start at `gap_end` (conventionally 4 GiB) — the same
+/// "memory hole" relocation real x86 firmware performs so no requested RAM
+/// is ever lost to the hole. `size_bytes` still reports the *total* guest
+/// RAM (sum of both regions), matching what was requested.
+///
+/// A split `GuestMemory` has two entries in `inner` — callers that assume a
+/// single flat region (e.g. anything using [`Self::as_ptr`] with the full
+/// `size_bytes` as a length) must check [`Self::is_split`] first; see its
+/// doc comment.
 #[derive(Clone)]
 pub struct GuestMemory {
     pub inner: Arc<GuestMemoryMmap>,
@@ -29,18 +43,39 @@ pub struct GuestMemory {
 
 impl GuestMemory {
     /// Build a single-region guest memory of `size_bytes` starting at GPA 0.
+    /// Callers that must stay below any device MMIO window (i.e. anything
+    /// booting a real x86_64 guest) should use [`Self::new_with_mmio_hole`]
+    /// instead so large requests don't silently collide with device
+    /// addresses.
     pub fn new(size_bytes: u64) -> Result<Self, MemoryError> {
-        Self::new_with_flags(size_bytes, false)
+        Self::new_with_flags(size_bytes, false, None)
     }
 
     /// Build guest memory with huge pages (2 MiB). Reduces TLB misses during
     /// the page-fault storm of UFFD lazy restore (E2B reports 5x faster
     /// first read). Requires `vm.nr_hugepages > 0` on the host.
     pub fn new_hugepages(size_bytes: u64) -> Result<Self, MemoryError> {
-        Self::new_with_flags(size_bytes, true)
+        Self::new_with_flags(size_bytes, true, None)
     }
 
-    fn new_with_flags(size_bytes: u64, huge_pages: bool) -> Result<Self, MemoryError> {
+    /// Build guest memory of `size_bytes`, relocating any portion that would
+    /// land at or above `gap_start` to instead start at `gap_end` — so the
+    /// caller's fixed device MMIO window `[gap_start, gap_end)` is always
+    /// free of guest RAM regardless of `size_bytes`. For `size_bytes <=
+    /// gap_start` this is identical to [`Self::new`] (single region, GPA 0).
+    pub fn new_with_mmio_hole(
+        size_bytes: u64,
+        gap_start: u64,
+        gap_end: u64,
+    ) -> Result<Self, MemoryError> {
+        Self::new_with_flags(size_bytes, false, Some((gap_start, gap_end)))
+    }
+
+    fn new_with_flags(
+        size_bytes: u64,
+        huge_pages: bool,
+        mmio_hole: Option<(u64, u64)>,
+    ) -> Result<Self, MemoryError> {
         if size_bytes == 0 || !size_bytes.is_multiple_of(4096) {
             return Err(MemoryError::Region(format!(
                 "size must be a non-zero multiple of 4096, got {size_bytes}"
@@ -57,7 +92,18 @@ impl GuestMemory {
         } else {
             size_bytes
         };
-        let inner = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), actual_size as usize)])
+
+        let ranges = match mmio_hole {
+            Some((gap_start, gap_end)) if actual_size > gap_start => {
+                debug_assert!(gap_end > gap_start);
+                vec![
+                    (GuestAddress(0), gap_start as usize),
+                    (GuestAddress(gap_end), (actual_size - gap_start) as usize),
+                ]
+            }
+            _ => vec![(GuestAddress(0), actual_size as usize)],
+        };
+        let inner = GuestMemoryMmap::from_ranges(&ranges)
             .map_err(|e| MemoryError::Assembly(format!("guest memory: {e}")))?;
 
         Ok(Self {
@@ -67,14 +113,25 @@ impl GuestMemory {
         })
     }
 
+    /// True if this `GuestMemory` was split across the MMIO hole (i.e. it
+    /// has more than one mmap'd region). Callers that need a single
+    /// contiguous view of all guest RAM (raw snapshot dump/restore) must
+    /// check this first and reject or handle split memory explicitly —
+    /// [`Self::as_ptr`] only ever points at the first region.
+    pub fn is_split(&self) -> bool {
+        self.inner.iter().count() > 1
+    }
+
     /// Raw pointer to the start of the first mmap'd region.
     ///
     /// SAFETY contract for callers: the returned pointer is valid for reads
-    /// and writes of `size_bytes` bytes for as long as this `GuestMemory`
-    /// stays alive. Used by the snapshot dumper.
+    /// and writes of `size_bytes` bytes **only when [`Self::is_split`] is
+    /// false** — a split `GuestMemory`'s first region is smaller than
+    /// `size_bytes` (the remainder lives in a second, non-adjacent mmap), so
+    /// treating this pointer as the base of a `size_bytes`-long buffer would
+    /// read/write past the first mapping. Used by the snapshot dumper, which
+    /// must reject split memory rather than call this.
     pub fn as_ptr(&self) -> *const u8 {
-        // vm-memory's `GuestMemory::iter` yields `&Self::R` (= `&GuestRegionMmap`).
-        // Our v1 single-region layout means the first region is the whole thing.
         self.inner
             .iter()
             .next()
@@ -144,5 +201,45 @@ mod tests {
         assert!(dirty.contains(0x1000));
         assert_eq!(dirty.len(), 2);
         assert!(m.drain_host_dirty().is_empty());
+    }
+
+    const GAP_START: u64 = 0x_D000_0000; // 3.25 GiB
+    const GAP_END: u64 = 0x1_0000_0000; // 4 GiB
+
+    #[test]
+    fn mmio_hole_below_gap_stays_single_region() {
+        let m = GuestMemory::new_with_mmio_hole(256 * 1024 * 1024, GAP_START, GAP_END)
+            .expect("256MiB below gap");
+        assert!(!m.is_split());
+        assert_eq!(m.size_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn mmio_hole_above_gap_splits_and_relocates() {
+        let requested = GAP_START + 512 * 1024 * 1024; // 3.25 GiB + 512 MiB
+        let m = GuestMemory::new_with_mmio_hole(requested, GAP_START, GAP_END).expect("above gap");
+        assert!(m.is_split());
+        // Total reported RAM must equal exactly what was requested — no
+        // capacity lost to the hole, it's relocated, not discarded.
+        assert_eq!(m.size_bytes, requested);
+        // Both halves must be reachable at their expected guest addresses.
+        m.write_phys(GAP_START - 4096, &[0xAA]).unwrap(); // last byte below the gap
+        m.write_phys(GAP_END, &[0xBB]).unwrap(); // first byte above the gap
+        let mut buf = [0u8; 1];
+        m.read_phys(GAP_START - 4096, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xAA);
+        m.read_phys(GAP_END, &mut buf).unwrap();
+        assert_eq!(buf[0], 0xBB);
+        // The gap itself must not be backed by any region.
+        assert!(m.read_phys(GAP_START, &mut buf).is_err());
+    }
+
+    #[test]
+    fn mmio_hole_exactly_at_gap_start_stays_single_region() {
+        // size_bytes == gap_start exactly: RAM ends right where the device
+        // window begins, no overlap and no need to split.
+        let m = GuestMemory::new_with_mmio_hole(GAP_START, GAP_START, GAP_END).expect("at gap");
+        assert!(!m.is_split());
+        assert_eq!(m.size_bytes, GAP_START);
     }
 }
