@@ -132,6 +132,14 @@ static void ensure_symlink(const char *path, const char *target) {
     }
 }
 
+/* Force a device node to the given mode regardless of how it was created.
+ * Best-effort: if this fails, the node keeps whatever mode it already had. */
+static void ensure_mode(const char *path, mode_t mode) {
+    if (chmod(path, mode) != 0) {
+        /* Best-effort; nothing sensible to do differently on failure here. */
+    }
+}
+
 /* PID 1 setup for booting an OCI-derived (initless) rootfs directly: bring up
  * the pseudo-filesystems a normal init would, so /dev/urandom, /dev/null, /proc
  * etc. exist for the workload (node reads /dev/urandom at startup). Must run
@@ -153,6 +161,21 @@ static void setup_as_init(void) {
         ensure_node("/dev/console", S_IFCHR | 0600, 5, 1);
         ensure_node("/dev/ttyS0", S_IFCHR | 0660, 4, 64);
     }
+    /* devtmpfs auto-populates nodes using the mount's "mode=" option as their
+     * permission when nothing (there is no udev here) fixes them up
+     * afterward -- so /dev/null and friends end up mode 0644 (only root can
+     * write), not the 0666 every real distro and every program that expects
+     * to write to /dev/null relies on. Concretely this breaks apt-get update
+     * for any non-root apt helper (surfaces as a confusing "gpgv ... required
+     * for verification" error, not an obvious permissions message). Fix the
+     * modes explicitly; harmless to repeat for the mknod fallback above,
+     * which already creates these with the right mode. */
+    ensure_mode("/dev/null", 0666);
+    ensure_mode("/dev/zero", 0666);
+    ensure_mode("/dev/full", 0666);
+    ensure_mode("/dev/random", 0666);
+    ensure_mode("/dev/urandom", 0666);
+    ensure_mode("/dev/tty", 0666);
     mount_pseudo("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,gid=5");
     /* devtmpfs does not auto-create the top-level /dev/ptmx that openpty()/
      * posix_openpt() actually open (only the kernel-registered /dev/pts/ptmx
