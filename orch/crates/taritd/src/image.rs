@@ -100,6 +100,11 @@ impl LocalImageConfig {
     }
 }
 
+/// `vmm pull --size` default (1024 MiB) — fine for the bare-OS base image,
+/// far too small for anything with real packages installed (a Node.js
+/// toolchain plus a couple of global npm packages alone exceeds it).
+pub const DEFAULT_IMAGE_SIZE_MIB: u64 = 1024;
+
 pub struct BuildImageOptions {
     pub oci_ref: String,
     pub image_ref: ImageRef,
@@ -107,6 +112,7 @@ pub struct BuildImageOptions {
     pub vmm_agent: PathBuf,
     pub db_path: PathBuf,
     pub images_dir: PathBuf,
+    pub size_mib: u64,
 }
 
 pub fn build_image(opts: BuildImageOptions) -> Result<ImageRecord> {
@@ -152,10 +158,15 @@ fn build_image_inner(
     temp_path: &Path,
     final_path: &Path,
 ) -> Result<ImageRecord> {
-    // `vmm pull --output <ext4> --agent <agent-binary> <docker://ref>`.
+    // `vmm pull --output <ext4> --size <mib> --agent <agent-binary> <docker://ref>`.
     // The OCI ref needs a transport scheme (default docker://) and the agent
     // binary is injected as init so app images (e.g. node:20) boot to the exec
-    // agent.
+    // agent. `--size` matters: `vmm pull`'s own default (1024 MiB) is only
+    // enough for a bare-OS image -- anything with real packages installed
+    // (a Node.js toolchain plus a couple of global npm packages alone) blows
+    // past it, and `mke2fs` fails outright with "Could not allocate block"
+    // partway through populating the filesystem rather than a clear
+    // out-of-space error up front.
     let oci_ref = if opts.oci_ref.contains("://") {
         opts.oci_ref.clone()
     } else {
@@ -165,6 +176,8 @@ fn build_image_inner(
         .arg("pull")
         .arg("--output")
         .arg(temp_path)
+        .arg("--size")
+        .arg(opts.size_mib.to_string())
         .arg("--agent")
         .arg(&opts.vmm_agent)
         .arg(&oci_ref)

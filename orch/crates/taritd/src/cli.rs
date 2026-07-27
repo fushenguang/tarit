@@ -111,6 +111,12 @@ pub struct ImageBuildArgs {
     oci: String,
     #[arg(long, value_name = "NAME[:TAG]")]
     name: String,
+    /// Output rootfs size in MiB. `vmm pull`'s own default (1024) only
+    /// fits a bare-OS image; anything with real packages installed needs
+    /// more room, sized generously here rather than failing partway
+    /// through `mke2fs` with an unhelpful "Could not allocate block".
+    #[arg(long, value_name = "MIB", default_value_t = crate::image::DEFAULT_IMAGE_SIZE_MIB)]
+    size_mib: u64,
 }
 
 #[derive(Debug, Args)]
@@ -435,6 +441,7 @@ fn image_build(args: ImageBuildArgs, json_output: bool) -> Result<()> {
         vmm_agent: config.vmm_agent,
         db_path: config.db_path,
         images_dir: config.images_dir,
+        size_mib: args.size_mib,
     })?;
     if json_output {
         println!("{}", image_json(&image));
