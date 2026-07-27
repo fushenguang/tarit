@@ -126,7 +126,10 @@ static void ensure_symlink(const char *path, const char *target) {
     if (access(path, F_OK) == 0) {
         return;
     }
-    (void)symlink(target, path);
+    if (symlink(target, path) != 0) {
+        /* Best-effort: if this fails, openpty() will fail exactly as it did
+         * before this fix, so there is no new failure mode to handle. */
+    }
 }
 
 /* PID 1 setup for booting an OCI-derived (initless) rootfs directly: bring up
