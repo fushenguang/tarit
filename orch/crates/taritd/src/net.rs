@@ -2016,11 +2016,27 @@ struct IsolationReport {
     failures: Vec<String>,
 }
 
+/// True when a `run("ip", ...)` failure is iproute2's stable "no such
+/// interface" error (RTNETLINK ENODEV), rather than some other operational
+/// failure. iproute2 has printed exactly this text for a missing device
+/// across the versions in common use; matching on it lets callers treat
+/// "already gone" as success instead of retrying an operation that can never
+/// succeed against a nonexistent device.
+fn is_missing_device_error(error: &OrchError) -> bool {
+    error.to_string().contains("Cannot find device")
+}
+
 fn emergency_isolate_tap_names(taps: &[String]) -> IsolationReport {
     let mut report = IsolationReport::default();
     for tap in taps {
         match run("ip", &["link", "set", tap, "down"]) {
             Ok(()) => {
+                report.contained.insert(tap.clone());
+            }
+            Err(link_down_error) if is_missing_device_error(&link_down_error) => {
+                // Already gone: isolation's goal (no guest traffic can
+                // possibly pass) is already satisfied, so this is
+                // containment, not a failure to contain.
                 report.contained.insert(tap.clone());
             }
             Err(link_down_error) => {
@@ -2034,6 +2050,9 @@ fn emergency_isolate_tap_names(taps: &[String]) -> IsolationReport {
                             tap,
                             "net: deleted recovered tap after link-down isolation failed"
                         );
+                    }
+                    Err(link_delete_error) if is_missing_device_error(&link_delete_error) => {
+                        report.contained.insert(tap.clone());
                     }
                     Err(link_delete_error) => report.failures.push(format!(
                         "emergency link-delete failed for {tap}: {link_delete_error}"
@@ -2254,8 +2273,22 @@ fn ingress_table_belongs_to_alloc(listing: &str, alloc: &NetAlloc) -> bool {
     let comment = nft_quote(&ingress_comment(alloc));
     let table = ingress_table_name(alloc.idx);
     let device = nft_quote(&alloc.tap);
+
+    let table_header = vec!["table".into(), "netdev".into(), table, "{".into()];
+    if !consume_nft_tokens(&tokens, &mut index, &table_header) {
+        return false;
+    }
+    // The kernel drops a netdev-hooked chain (and, with it, this table's only
+    // chain) once its target device is gone -- which is exactly what happens
+    // between delete_tap_for_teardown() removing the TAP and this check
+    // running. An empty table under our generated per-slot name is that
+    // expected post-teardown shape, not evidence of tampering: nothing else
+    // creates or repurposes a `taritd_ingress_<slot>` table.
+    if tokens.get(index) == Some(&"}".to_string()) && index + 1 == tokens.len() {
+        return true;
+    }
+
     let required = [
-        vec!["table".into(), "netdev".into(), table, "{".into()],
         vec!["chain".into(), NFT_INGRESS_CHAIN.into(), "{".into()],
         vec![
             "type".into(),
@@ -2292,7 +2325,7 @@ fn ingress_table_belongs_to_alloc(listing: &str, alloc: &NetAlloc) -> bool {
         if !consume_nft_tokens(&tokens, &mut index, expected) {
             return false;
         }
-        if matches!(rule_index, 3 | 4) && tokens.get(index).is_some_and(|token| token == ";") {
+        if matches!(rule_index, 2 | 3) && tokens.get(index).is_some_and(|token| token == ";") {
             index += 1;
         }
     }
