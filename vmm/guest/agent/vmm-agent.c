@@ -120,6 +120,15 @@ static void ensure_node(const char *path, mode_t mode, unsigned major, unsigned 
     (void)mknod(path, mode, makedev(major, minor));
 }
 
+/* Ensure a symlink exists at path pointing at target (fallback when devtmpfs
+ * or the image's own /dev didn't already provide it). */
+static void ensure_symlink(const char *path, const char *target) {
+    if (access(path, F_OK) == 0) {
+        return;
+    }
+    (void)symlink(target, path);
+}
+
 /* PID 1 setup for booting an OCI-derived (initless) rootfs directly: bring up
  * the pseudo-filesystems a normal init would, so /dev/urandom, /dev/null, /proc
  * etc. exist for the workload (node reads /dev/urandom at startup). Must run
@@ -142,6 +151,13 @@ static void setup_as_init(void) {
         ensure_node("/dev/ttyS0", S_IFCHR | 0660, 4, 64);
     }
     mount_pseudo("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,gid=5");
+    /* devtmpfs does not auto-create the top-level /dev/ptmx that openpty()/
+     * posix_openpt() actually open (only the kernel-registered /dev/pts/ptmx
+     * inside the devpts mount exists by default) -- every mainstream distro
+     * ships /dev/ptmx as a static symlink to pts/ptmx for exactly this reason.
+     * Without it, openpty() in start_pty_session() fails with ENOENT and the
+     * interactive PTY/SSH-gateway path never gets a shell. */
+    ensure_symlink("/dev/ptmx", "pts/ptmx");
     mount_pseudo("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755");
     mount_pseudo("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777");
 
