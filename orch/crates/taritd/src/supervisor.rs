@@ -3778,6 +3778,14 @@ impl VmmSupervisor {
         transitions.finish()
     }
 
+    /// Stop a VM's guest process and release its runtime resources (socket,
+    /// cgroup, network allocation) WITHOUT touching its private overlay disk.
+    /// This is the vm-stop-delete-split non-destructive core: every existing
+    /// caller of this function retains the VM's disk, whether the caller is a
+    /// user-initiated stop, an unexpected VMM exit, a boot failure, a
+    /// shutdown sweep, or a readopt failure. Only `purge_vm` (reached
+    /// exclusively through an explicit force-delete) additionally deletes the
+    /// overlay via `purge_vm_overlay`.
     fn teardown_vm(&self, id: Uuid, vm: &RunningVm) -> Result<(), OrchError> {
         let mut failures = Vec::new();
         graceful_stop_vmm(&vm.socket_path);
@@ -3790,17 +3798,6 @@ impl VmmSupervisor {
         };
         if let Err(error) = remove_file_if_present(&vm.socket_path) {
             failures.push(format!("remove VMM socket: {error}"));
-        }
-        // The golden registry owns a golden source VM's overlay: warm restores
-        // seed every clone from it, so tearing down that VM must not delete it.
-        match self.owns_golden_artifact(Path::new(&self.overlay_path_for(id))) {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Err(error) = remove_file_if_present(Path::new(&self.overlay_path_for(id))) {
-                    failures.push(format!("remove VMM overlay: {error}"));
-                }
-            }
-            Err(error) => failures.push(error.to_string()),
         }
         // The exact child can only be empty after the process is confirmed
         // dead. Removing only this UUID-derived child preserves the
@@ -3831,6 +3828,31 @@ impl VmmSupervisor {
         } else {
             Err(OrchError::Internal(failures.join("; ")))
         }
+    }
+
+    /// Delete a VM's private overlay disk, unless it is registered as a
+    /// golden artifact the warm-pool registry still depends on. This is the
+    /// ONLY function in the supervisor that deletes an overlay file - it is
+    /// reached exclusively through `purge_vm`, which is itself reached
+    /// exclusively through an explicit force-delete request.
+    fn purge_vm_overlay(&self, id: Uuid) -> Result<(), OrchError> {
+        // The golden registry owns a golden source VM's overlay: warm restores
+        // seed every clone from it, so purging that VM must not delete it.
+        match self.owns_golden_artifact(Path::new(&self.overlay_path_for(id))) {
+            Ok(true) => Ok(()),
+            Ok(false) => remove_file_if_present(Path::new(&self.overlay_path_for(id)))
+                .map_err(|error| OrchError::Internal(format!("remove VMM overlay: {error}"))),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Stop a VM (if running) and permanently delete its private overlay
+    /// disk. This is the vm-delete capability's force path - the only way to
+    /// actually destroy a VM's data. Every other stop/teardown path in this
+    /// module retains the disk.
+    pub fn purge_vm(&self, id: Uuid) -> Result<(), OrchError> {
+        self.stop_vm(id)?;
+        self.purge_vm_overlay(id)
     }
 
     fn defer_network_teardown(
@@ -4784,7 +4806,13 @@ mod tests {
             "target/taritd-restart-quarantine-failure-{}",
             Uuid::new_v4()
         ));
-        let socket_path = root.join("missing-vmm.sock");
+        // A directory at the socket path (instead of a missing/regular file)
+        // forces `remove_file_if_present` to fail inside `teardown_vm`, since
+        // teardown no longer touches the overlay at all post-split - this is
+        // now the only remaining deterministic way to fail quarantine's
+        // cleanup without mocking process/network internals.
+        let socket_path = root.join("socket-is-a-directory");
+        std::fs::create_dir_all(&socket_path).unwrap();
         let supervisor = Arc::new(VmmSupervisor::new(supervisor_config(&root)));
         let id = Uuid::new_v4();
         let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
@@ -4796,8 +4824,6 @@ mod tests {
             id,
             RunningVm::new(process.pid, socket_path.clone(), process, None),
         );
-        let overlay_path = PathBuf::from(supervisor.overlay_path_for(id));
-        std::fs::create_dir_all(&overlay_path).unwrap();
         let mut record = restart_record(id, &socket_path);
 
         let error = test_runtime()
@@ -4810,7 +4836,7 @@ mod tests {
         );
         assert!(supervisor.operation_gate(id).is_ok());
         assert!(supervisor.scheduler.is_reserved(id));
-        std::fs::remove_dir(&overlay_path).unwrap();
+        std::fs::remove_dir(&socket_path).unwrap();
         supervisor.stop_vm(id).unwrap();
         assert!(supervisor.scheduler.release(id));
         std::fs::remove_dir_all(root).unwrap();
@@ -5432,8 +5458,13 @@ mod tests {
         assert!(!supervisor.has_retained_boot(id));
     }
 
+    // `teardown_vm` (the non-destructive core) never deletes any overlay,
+    // golden or not - see `stop_vm_retains_overlay_disk`. The golden-vs-
+    // non-golden distinction now only matters to the destructive path, so
+    // this test targets `purge_vm_overlay` directly instead of going through
+    // a `RunningVm`/process.
     #[test]
-    fn teardown_preserves_a_remembered_golden_overlay() {
+    fn purge_vm_overlay_preserves_a_remembered_golden_overlay() {
         let supervisor = test_supervisor();
         let id = Uuid::new_v4();
         let overlay = PathBuf::from(supervisor.overlay_path_for(id));
@@ -5444,24 +5475,20 @@ mod tests {
             .remember_golden_artifacts(&mut artifacts)
             .unwrap();
 
-        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
-        let vm = RunningVm::new(process.pid, PathBuf::new(), process, None);
-        supervisor.teardown_vm(id, &vm).unwrap();
+        supervisor.purge_vm_overlay(id).unwrap();
         assert!(
             overlay.exists(),
-            "warm restores seed from the golden overlay; tearing down its source VM must not delete it"
+            "warm restores seed from the golden overlay; purging its source VM must not delete it"
         );
         std::fs::remove_file(&overlay).unwrap();
 
         let other = Uuid::new_v4();
         let scratch = PathBuf::from(supervisor.overlay_path_for(other));
         std::fs::write(&scratch, b"private upper").unwrap();
-        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
-        let vm = RunningVm::new(process.pid, PathBuf::new(), process, None);
-        supervisor.teardown_vm(other, &vm).unwrap();
+        supervisor.purge_vm_overlay(other).unwrap();
         assert!(
             !scratch.exists(),
-            "a non-golden overlay is removed on teardown"
+            "a non-golden overlay is removed by purge_vm_overlay"
         );
     }
 
