@@ -67,9 +67,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use tarit_store::Store;
 use tarit_types::{
     AuditEvent, CreateShareRequest, CreateVmRequest, EgressUpdateRequest, ErrorBody,
-    ExecuteRequest, ExecutionRecord, ExecutionStatus, OrchError, PublicVmRecord, RestartPolicy,
-    ShareRecord, ShareTokenResponse, ShareVisibility, SnapshotRequest, UpdateShareRequest,
-    UsageEvent, UsageSummary, VmRecord, VmStatus,
+    ExecuteRequest, ExecutionRecord, ExecutionStatus, OrchError, PublicVmRecord, ShareRecord,
+    ShareTokenResponse, ShareVisibility, SnapshotRequest, UpdateShareRequest, UsageEvent,
+    UsageSummary, VmRecord, VmStatus,
 };
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -2399,6 +2399,7 @@ mod tests {
     };
     use std::time::Duration;
     use tarit_store::Store;
+    use tarit_types::RestartPolicy;
     use tower::ServiceExt;
 
     #[test]

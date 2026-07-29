@@ -25,7 +25,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tarit_types::{CreateVmRequest, EgressUpdateRequest, RestartPolicy, RestoreRequest, VmRecord};
+use tarit_types::{CreateVmRequest, EgressUpdateRequest, RestoreRequest, VmRecord};
 use uuid::Uuid;
 
 use crate::{
@@ -655,7 +655,7 @@ async fn internal_egress(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use tarit_types::VmStatus;
+    use tarit_types::{RestartPolicy, VmStatus};
 
     fn sample_record() -> VmRecord {
         VmRecord {
