@@ -2279,7 +2279,7 @@ impl VmmSupervisor {
         }
 
         let overlay = self.overlay_path_for_config(id, vm_config);
-        let vmm_config = build_vmm_config(vm_config, vm.net.as_ref(), overlay);
+        let vmm_config = build_vmm_config(vm_config, vm.net.as_ref(), overlay.clone());
         let client = VmmClient::new(&vm.socket_path);
         if let Err(e) = client.create(vmm_config) {
             return Err(self.cleanup_boot_failure(
@@ -2288,6 +2288,35 @@ impl VmmSupervisor {
                 &vm,
                 OrchError::Vmm(format!("create vm: {e}")),
             ));
+        }
+        // vmm-core tracks a freshly created overlay as an owned scratch file
+        // and deletes it when this VM later stops (VmTransientFiles::cleanup
+        // on VmInstance::drop) - the same mechanism the golden-snapshot path
+        // already releases its own overlay from. Left unreleased, that
+        // auto-cleanup would silently defeat vm-stop-delete-split's guarantee
+        // that only an explicit purge deletes the disk: taritd's own
+        // teardown_vm no longer deletes it (see stop_vm/purge_vm), but
+        // vmm-core would anyway. Release it here, immediately after create
+        // succeeds and before any other fallible step, so every later boot
+        // failure in this function tears down a VMM that no longer owns the
+        // overlay at all.
+        if let Some(overlay_path) = &overlay {
+            let artifact = OwnedArtifact::capture(overlay_path).map_err(|error| {
+                self.cleanup_boot_failure(
+                    id,
+                    &ticket.control,
+                    &vm,
+                    OrchError::Internal(format!("open created overlay {overlay_path}: {error}")),
+                )
+            })?;
+            if let Err(error) = client.release_scratch(overlay_path, artifact.identity()) {
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &ticket.control,
+                    &vm,
+                    OrchError::Vmm(format!("release overlay scratch {overlay_path}: {error}")),
+                ));
+            }
         }
         if !boot_can_publish(&ticket.control, self.is_shutting_down()) {
             return Err(self.cleanup_boot_failure(id, &ticket.control, &vm, self.shutdown_error()));
@@ -2710,18 +2739,25 @@ impl VmmSupervisor {
             return Err(self.discard_booted_vm(booted));
         }
         let client = VmmClient::new(&booted.vm.socket_path);
-        for artifact in &artifacts {
-            let path = artifact.path().display().to_string();
-            let identity = artifact.identity();
-            if let Err(error) = client.release_scratch(&path, identity) {
-                cleanup_golden_artifacts(artifacts);
-                return Err(self.cleanup_boot_failure(
-                    id,
-                    &booted.control,
-                    &booted.vm,
-                    OrchError::Vmm(format!("release golden scratch {path}: {error}")),
-                ));
-            }
+        // The overlay artifact (if any) was already released from vmm-core's
+        // owned-scratch tracking inside `boot_vm`, right after `create()`
+        // succeeded (see boot_vm's comment on the release call) - releasing
+        // it again here would fail with "not owned by this VM". Only the
+        // golden RAM snapshot file still needs releasing here.
+        let snapshot_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.path() == Path::new(&snapshot_path))
+            .expect("capture_golden_artifacts always includes the snapshot artifact");
+        if let Err(error) =
+            client.release_scratch(&snapshot_path, snapshot_artifact.identity())
+        {
+            cleanup_golden_artifacts(artifacts);
+            return Err(self.cleanup_boot_failure(
+                id,
+                &booted.control,
+                &booted.vm,
+                OrchError::Vmm(format!("release golden scratch {snapshot_path}: {error}")),
+            ));
         }
         let artifact_keys = artifacts
             .iter()
@@ -6354,5 +6390,123 @@ mod tests {
 
         assert_eq!(std::fs::read(&snapshot).unwrap(), b"replacement");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Real-KVM integration test for a vm-stop-delete-split finding (task
+    // group 4): `create_live`'s real RPC dispatch target tracks every
+    // freshly created overlay as an "owned scratch file" and deletes it when
+    // the VM later stops (VmTransientFiles::cleanup on VmInstance::drop) -
+    // completely independent of taritd's own teardown_vm/stop_vm/purge_vm
+    // split. Without releasing the overlay (exactly like the golden-snapshot
+    // path already does for its own overlay - see boot_vm's release_scratch
+    // call), this auto-cleanup silently defeats the guarantee that only an
+    // explicit purge deletes the disk. This test spawns the REAL vmm binary
+    // twice to prove the release call in boot_vm is both necessary and
+    // sufficient: round 1 boots, writes a marker, releases, stops; round 2 is
+    // an entirely fresh vmm process pointed at the same overlay path, and
+    // must see the marker.
+    //
+    // Needs real KVM + guest assets not present in a generic checkout, so it
+    // skips unless TARIT_TEST_VMM_BIN/TARIT_TEST_KERNEL/TARIT_TEST_ROOTFS are
+    // set - see vmm/ci/overlay-reuse-gate.sh for the equivalent raw-protocol
+    // gate script that pinned this down originally.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn released_overlay_survives_stop_and_is_reusable_by_a_fresh_vmm_process() {
+        let (Ok(vmm_bin), Ok(kernel), Ok(rootfs)) = (
+            std::env::var("TARIT_TEST_VMM_BIN"),
+            std::env::var("TARIT_TEST_KERNEL"),
+            std::env::var("TARIT_TEST_ROOTFS"),
+        ) else {
+            eprintln!(
+                "skipping released_overlay_survives_stop_and_is_reusable_by_a_fresh_vmm_process: \
+                 set TARIT_TEST_VMM_BIN/TARIT_TEST_KERNEL/TARIT_TEST_ROOTFS (needs real KVM + guest assets)"
+            );
+            return;
+        };
+
+        let root = PathBuf::from(format!("target/taritd-overlay-reuse-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let overlay = root.join("overlay.cow");
+        let socket = root.join("vmm.sock");
+
+        // read_only=false: this is the *guest's* root mount flag
+        // (VmSpawnConfig::read_only), not the host-side base-image openness -
+        // the base is always opened read-only under a CoW overlay regardless.
+        // A read-only guest mount would reject the marker write below.
+        let mut cfg = spawn_config(false, Some(PathBuf::from(&rootfs)));
+        cfg.kernel_path = PathBuf::from(&kernel);
+        cfg.memory_mib = 512;
+        let vmm_config = build_vmm_config(&cfg, None, Some(overlay.display().to_string()));
+
+        // --- round 1: fresh boot, write a marker, release, stop ---
+        let mut child1 = Command::new(&vmm_bin)
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vmm serve (round 1)");
+        tarit_vmm_client::wait_for_socket(&socket, Duration::from_secs(5))
+            .expect("vmm socket (round 1)");
+        let client = VmmClient::new(&socket).with_request_timeout(Duration::from_secs(30));
+        client
+            .create(vmm_config.clone())
+            .expect("create (round 1)");
+        let artifact =
+            OwnedArtifact::capture(&overlay).expect("open just-created overlay (round 1)");
+        client
+            .release_scratch(&overlay.display().to_string(), artifact.identity())
+            .expect("release overlay from vmm-core's owned-scratch tracking (round 1)");
+        std::thread::sleep(Duration::from_secs(25));
+        let (exit_code, stdout, stderr, _) = client
+            .exec(
+                "sh -c 'echo overlay-reuse-marker > /root/persisted.txt && sync'",
+                20_000,
+            )
+            .expect("write marker (round 1)");
+        assert_eq!(
+            exit_code, 0,
+            "writing the marker must succeed: stdout={stdout:?} stderr={stderr:?}"
+        );
+        client.stop().expect("stop (round 1)");
+        let _ = child1.kill();
+        let _ = child1.wait();
+
+        assert!(
+            overlay.exists(),
+            "the overlay must survive round 1's stop once released from vmm-core's tracking"
+        );
+
+        // --- round 2: entirely fresh vmm process, same overlay path ---
+        let mut child2 = Command::new(&vmm_bin)
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn vmm serve (round 2)");
+        tarit_vmm_client::wait_for_socket(&socket, Duration::from_secs(5))
+            .expect("vmm socket (round 2)");
+        let client2 = VmmClient::new(&socket).with_request_timeout(Duration::from_secs(30));
+        client2
+            .create(vmm_config)
+            .expect("create reusing the existing overlay (round 2)");
+        std::thread::sleep(Duration::from_secs(25));
+        let (exit_code, stdout, _, _) = client2
+            .exec("cat /root/persisted.txt", 20_000)
+            .expect("read back marker (round 2)");
+        assert_eq!(exit_code, 0, "the marker file must still exist");
+        assert!(
+            stdout.contains("overlay-reuse-marker"),
+            "round 2 must see round 1's marker via the reused overlay, got: {stdout:?}"
+        );
+        client2.stop().expect("stop (round 2)");
+        let _ = child2.kill();
+        let _ = child2.wait();
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
