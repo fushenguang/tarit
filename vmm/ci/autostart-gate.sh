@@ -87,7 +87,7 @@ echo "  (waiting 25s for systemd + vmm-agent to start)"
 sleep 25
 
 echo "=== install /etc/vmm-agent/autostart (round 1 boots BEFORE this exists, so it must not have run yet) ==="
-api '{"op":"exec","command":"mkdir -p /etc/vmm-agent && printf \"#!/bin/sh\\necho autostart-ran >> /root/autostart-ran.log\\n\" > /etc/vmm-agent/autostart && chmod 755 /etc/vmm-agent/autostart && sync","timeout_ms":20000}'
+api '{"op":"exec","command":"mkdir -p /etc/vmm-agent && printf \"#!/bin/sh\\necho AUTOSTART-MARKER-OK >> /root/autostart-ran.log\\n\" > /etc/vmm-agent/autostart && chmod 755 /etc/vmm-agent/autostart && sync","timeout_ms":20000}'
 echo ""
 
 echo "=== confirm nothing ran it yet (round 1's agent already started before the file existed) ==="
@@ -118,7 +118,7 @@ echo "=== read back the marker (this is the actual assertion) ==="
 RESULT=$(api '{"op":"exec","command":"cat /root/autostart-ran.log 2>&1 || echo NOFILE","timeout_ms":20000}')
 echo "$RESULT"
 echo ""
-if echo "$RESULT" | grep -q "autostart-ran"; then
+if echo "$RESULT" | grep -q "AUTOSTART-MARKER-OK"; then
   echo "PASS: autostart script ran on its own during round 2's boot, with no host-side exec trigger"
 else
   echo "FAIL: autostart marker not found — guest boot did not self-trigger /etc/vmm-agent/autostart"
