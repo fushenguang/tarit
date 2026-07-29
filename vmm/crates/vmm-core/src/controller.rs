@@ -413,19 +413,11 @@ impl VmmController {
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM (boot first)".into()))?;
 
-        // The dump below reads the whole guest image through
-        // `GuestMemory::as_ptr()`, which only ever points at the first of a
-        // split guest-memory's regions (see its doc comment) — reject
-        // explicitly rather than silently truncating the dump to that first
-        // region while claiming `size_bytes` (the full, unsplit total) was
-        // captured.
-        if let Some(g) = vm.guest_mem.as_ref() {
-            if g.is_split() {
-                return Err(VmmError::Snapshot(
-                    "snapshot of a VM with memory split across the device MMIO window is not yet supported".into(),
-                ));
-            }
-        }
+        // Split guest memory (VM sized past the device MMIO window, see
+        // `GuestMemory::is_split`) is handled below by concatenating each
+        // region's bytes into an owned buffer instead of taking a single
+        // `as_ptr()`+`size_bytes` slice — `as_ptr()` only ever points at the
+        // first region, which is why this used to be rejected outright.
 
         let path_buf = unique_scratch_snapshot_path("vmm-snap")?;
         let path = path_buf.to_string_lossy().into_owned();
@@ -458,7 +450,21 @@ impl VmmController {
             // turn dirty logging on so the NEXT snapshot can be a small diff. Using a
             // raw pointer to the guest mapping avoids borrowing `vm` so the chain
             // fields can be updated afterwards.
+            //
+            // Non-split memory keeps the zero-copy `as_ptr()`+`size_bytes` slice
+            // (the common case, no need to pay a copy for it). Split memory (see
+            // `GuestMemory::is_split`) has no single contiguous host mapping, so
+            // it's concatenated region-by-region (ascending GPA — the same order
+            // `GuestMemory::new_with_mmio_hole` always builds them in) into an
+            // owned buffer instead; `read_snapshot`'s restore path below splits
+            // this same flat buffer back into regions the same way, so the two
+            // sides agree without needing any extra metadata in the file format.
+            let mut owned_mem: Option<Vec<u8>> = None;
             let (mem_ptr, mem_bytes): (*const u8, usize) = match vm.guest_mem.as_ref() {
+                Some(g) if g.is_split() => {
+                    owned_mem = Some(concat_split_guest_memory(g));
+                    (std::ptr::null(), 0)
+                }
                 Some(g) => {
                     let mem_bytes = usize::try_from(g.size_bytes)
                         .map_err(|_| VmmError::Memory("guest memory too large".into()))?;
@@ -469,7 +475,9 @@ impl VmmController {
                     None => (std::ptr::null(), 0),
                 },
             };
-            let mem_slice: &[u8] = if mem_ptr.is_null() {
+            let mem_slice: &[u8] = if let Some(buf) = owned_mem.as_ref() {
+                buf.as_slice()
+            } else if mem_ptr.is_null() {
                 &[]
             } else {
                 // SAFETY: ptr+len describe a live mapping/Vec owned by `vm` for this
@@ -2270,6 +2278,54 @@ pub(crate) fn write_snapshot_file(
     )
 }
 
+/// Concatenate a split `GuestMemory`'s regions, in ascending-GPA order (the
+/// same order `GuestMemory::new_with_mmio_hole` always builds them in), into
+/// one flat owned buffer — used by `snapshot()` because `as_ptr()` only ever
+/// points at the first region, so there's no single contiguous slice to
+/// borrow when memory has been split across the device MMIO window.
+/// `fill_split_guest_memory` below is the exact inverse, used by `restore()`.
+fn concat_split_guest_memory(mem: &vmm_memory_backend::GuestMemory) -> Vec<u8> {
+    use vm_memory::{GuestMemoryBackend as _, GuestMemoryRegion as _};
+    let mem_bytes = usize::try_from(mem.size_bytes).unwrap_or(0);
+    let mut buf = Vec::with_capacity(mem_bytes);
+    for region in mem.inner.iter() {
+        let len = region.len() as usize;
+        // SAFETY: region.as_ptr()/len() describe a live mmap'd region owned
+        // by `mem` for the duration of this call; we only read it.
+        let region_bytes = unsafe { std::slice::from_raw_parts(region.as_ptr(), len) };
+        buf.extend_from_slice(region_bytes);
+    }
+    buf
+}
+
+/// Inverse of `concat_split_guest_memory`: read a flat byte stream off
+/// `file` (starting at its current position) and copy it into `mem`'s
+/// regions in the same ascending-GPA order it was concatenated in. `mem`
+/// must be freshly allocated and not yet shared (this exclusively owns and
+/// directly writes each region's backing mmap).
+fn fill_split_guest_memory(
+    mem: &vmm_memory_backend::GuestMemory,
+    file: &mut std::fs::File,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    use vm_memory::{GuestMemoryBackend as _, GuestMemoryRegion as _};
+    for region in mem.inner.iter() {
+        let len = region.len() as usize;
+        // Read directly into the region's own mmap — same as the
+        // single-region path below (`from_raw_parts_mut` + one `read_exact`)
+        // — instead of an intermediate `Vec` + a second copy. For a
+        // multi-GiB region that avoids doubling both the memory footprint
+        // and the copy work.
+        // SAFETY: `mem` was just allocated by the caller and not yet
+        // shared — region.as_ptr()/len() describe a live mmap'd region we
+        // exclusively own for the lifetime of this call.
+        let region_slice: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(region.as_ptr() as *mut u8, len) };
+        file.read_exact(region_slice)?;
+    }
+    Ok(())
+}
+
 fn write_scratch_snapshot_file(
     owned_file: &OwnedScratchFile,
     state_blob: &[u8],
@@ -2986,26 +3042,32 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
                 header.mem_crc
             )));
         }
-        // `mem.as_ptr()` below only ever points at the first of a split
-        // guest-memory's regions — a snapshot whose `mem_len` reaches the
-        // device MMIO window would silently read/write past that first
-        // mapping, so reject it explicitly instead.
-        if layout.mem_len > vmm_loader::MMIO_GAP_START {
-            return Err(VmmError::Snapshot(format!(
-                "{path_display}: restoring snapshots with mem_len 0x{:x} > 0x{:x} not yet supported (would need a split guest-memory region)",
-                layout.mem_len,
-                vmm_loader::MMIO_GAP_START
-            )));
-        }
-        let mem = vmm_memory_backend::GuestMemory::new(layout.mem_len)
-            .map_err(|e| VmmError::Memory(e.to_string()))?;
-        let mem_slice: &mut [u8] = {
-            // SAFETY: `mem` was just allocated with `mem_len` bytes and is owned here.
-            unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_len) }
-        };
+        // A `mem_len` reaching the device MMIO window needs a split
+        // `GuestMemory` (same `new_with_mmio_hole` constructor the normal
+        // boot path uses) — build it split up front, then fill it region by
+        // region below instead of assuming one contiguous mapping.
+        let mem = vmm_memory_backend::GuestMemory::new_with_mmio_hole(
+            layout.mem_len,
+            vmm_loader::MMIO_GAP_START,
+            vmm_loader::MMIO_GAP_END,
+        )
+        .map_err(|e| VmmError::Memory(e.to_string()))?;
         file.seek(SeekFrom::Start(layout.mem_offset))
             .map_err(|e| VmmError::Snapshot(format!("seek mem in {path_display}: {e}")))?;
-        rd(&mut file, mem_slice, "read mem")?;
+        if mem.is_split() {
+            // The writer concatenated regions in ascending-GPA order (the same
+            // order `new_with_mmio_hole` always builds them in) into one flat
+            // buffer with no per-region metadata — read it back the same way,
+            // region by region, off the same file cursor.
+            fill_split_guest_memory(&mem, &mut file)
+                .map_err(|e| VmmError::Snapshot(format!("read mem region in {path_display}: {e}")))?;
+        } else {
+            let mem_slice: &mut [u8] = {
+                // SAFETY: `mem` was just allocated with `mem_len` bytes and is owned here.
+                unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_len) }
+            };
+            rd(&mut file, mem_slice, "read mem")?;
+        }
         Ok(SnapshotContent::Full { mem, state })
     } else if &magic == b"VMSD" {
         let mut u16b = [0u8; 2];
@@ -4240,6 +4302,68 @@ mod tests {
         assert_eq!(layout.state_len, 123);
         assert_eq!(layout.mem_offset, 32 + 123);
         assert_eq!(layout.mem_len, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn split_guest_memory_round_trips_through_concat_and_fill() {
+        // Small synthetic gap so this doesn't need a real multi-GiB
+        // allocation — concat_split_guest_memory/fill_split_guest_memory
+        // only care that GuestMemory reports more than one region, not
+        // about the actual MMIO_GAP_START/END constants (production code
+        // passes those in separately, at the `read_snapshot` call site).
+        let gap_start = 8192u64;
+        let gap_end = 16384u64;
+        let total = 12288u64; // 8192 bytes in region 0, 4096 in region 1
+
+        let src = vmm_memory_backend::GuestMemory::new_with_mmio_hole(total, gap_start, gap_end)
+            .expect("build split source memory");
+        assert!(src.is_split(), "test fixture should actually be split");
+
+        // Distinct, position-independent fill per region so a
+        // region-boundary bug (off-by-one, swapped order, wrong length)
+        // shows up as a content mismatch instead of accidentally passing.
+        src.write_phys(0, &vec![0xAAu8; 8192]).expect("fill region 0");
+        src.write_phys(gap_end, &vec![0xBBu8; 4096])
+            .expect("fill region 1");
+
+        let flat = concat_split_guest_memory(&src);
+        assert_eq!(flat.len(), total as usize);
+        assert!(flat[..8192].iter().all(|&b| b == 0xAA));
+        assert!(flat[8192..].iter().all(|&b| b == 0xBB));
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "vmm-core-test-split-mem-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp_path).expect("create temp file");
+            std::io::Write::write_all(&mut f, &flat).expect("write temp file");
+        }
+
+        let dst = vmm_memory_backend::GuestMemory::new_with_mmio_hole(total, gap_start, gap_end)
+            .expect("build split destination memory");
+        {
+            let mut f = std::fs::File::open(&tmp_path).expect("reopen temp file");
+            fill_split_guest_memory(&dst, &mut f).expect("fill destination regions");
+        }
+        std::fs::remove_file(&tmp_path).ok();
+
+        let mut readback0 = vec![0u8; 8192];
+        dst.read_phys(0, &mut readback0)
+            .expect("read region 0 back");
+        assert!(
+            readback0.iter().all(|&b| b == 0xAA),
+            "region 0 content mismatch"
+        );
+
+        let mut readback1 = vec![0u8; 4096];
+        dst.read_phys(gap_end, &mut readback1)
+            .expect("read region 1 back");
+        assert!(
+            readback1.iter().all(|&b| b == 0xBB),
+            "region 1 content mismatch"
+        );
     }
 
     #[test]
