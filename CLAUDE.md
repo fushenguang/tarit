@@ -51,6 +51,53 @@ once.
 This TDD requirement is scoped to `vmm/`/`orch/` only — it does not extend to
 any application-layer consumer of this project.
 
+## Notable past bugs (read before touching VM stop/delete/create)
+
+The `vm-stop-delete-split` change (see `openspec/changes/vm-stop-delete-split/`
+and its `design.md` for the full account) found three real bugs while making
+"stop" retain a VM's overlay disk by default. Each one independently defeated
+the fix, and none were obvious from reading the orchestration code alone —
+they only surfaced by writing a real create → stop → fresh-process → reboot
+round-trip test on live KVM and a real HTTP client:
+
+- **`Controller::create_live` (`vmm-core/src/controller.rs`), not the unused
+  `Controller::create`, is the real dispatch target for the `create` RPC.**
+  The two functions coexist and are easy to conflate. `create_live` tracks
+  every freshly created overlay as an "owned scratch file" and **deletes it
+  when the VM instance later drops** — a second, independent overlay-deletion
+  path living entirely inside vmm-core, invisible to and unaffected by
+  anything the orchestrator (`taritd`) does. If you change stop/delete
+  semantics at the `orch/` layer, check whether the disk is *also* tracked
+  for auto-cleanup at this layer — the fix was calling the existing
+  `ReleaseScratch` RPC right after `create()` succeeds (the same mechanism
+  the golden-snapshot capture path already used for its own overlay).
+- **`OwnedOverlayGuard::create` hard-required `O_CREAT|O_EXCL`** for every
+  volume overlay, rejecting any path that already existed. This was the
+  actual blocker for "cold-boot reusing an existing overlay" — fixed by
+  trying `OwnedScratchFile::adopt_private` first (the same primitive
+  `restore()`'s `prepare_restore_overlay` already used), falling back to
+  `create_new` only when the path is new.
+- **`cluster::resolve_owner`'s single-host fallback excluded `VmStatus::Stopped`
+  from "does this VM exist locally"** (`orch/crates/taritd/src/cluster.rs`).
+  Every handler that reads or acts on a VM (`GET`, `/status`, `/start`, ...)
+  calls `resolve_owner` first, so this silently 404'd every one of them
+  against a stopped VM — directly contradicting this repo's own `API.md`,
+  which documented that a stopped VM's record stays gettable. This predates
+  `vm-stop-delete-split`: it was presumably written back when `Stopped`
+  implicitly meant "already deleted, a dying husk", which was true before
+  this change and is exactly the assumption this change overturns. If a
+  future change gives another status new "this is still a real, useful
+  record" semantics, grep `resolve_owner` for the same class of stale
+  exclusion.
+
+Separately: `orch/crates/taritd/src/ops.rs`'s `test_state_with_durable_writer()`
+test helper returns `(AppState, Receiver<StoreWrite>)`. Any test path that
+reaches real SQLite persistence (`persist_stopped_record` and friends)
+`.await`s an ack on that channel — if the test discards the receiver
+(`let (state, _writes) = ...`) instead of spawning a consumer for it, `cargo
+test` hangs silently instead of failing. See `warm_publication_failures_
+retain_the_live_vm_and_retry_ownership` for the consumer-loop pattern to copy.
+
 ## Building and testing
 
 ```sh
