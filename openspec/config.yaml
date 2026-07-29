@@ -1,0 +1,45 @@
+schema: spec-driven
+
+# Project context (shown to AI when creating artifacts)
+context: |
+  Independent fork of instavm/tarit (see README.md's "About this fork"). Two
+  cargo workspaces developed together: vmm/ (the VMM, rust-vmm-based
+  hypervisor) and orch/ (taritd, the fleet orchestrator), sharing wire types
+  via proto/ (tarit-proto, KVM-free).
+
+  Fork policy: not tracking upstream mergeability. Scan instavm/tarit's commit
+  log periodically (monthly) for rust-vmm/KVM/virtio security fixes and port
+  those manually; do not attempt full upstream sync.
+
+  OpenSpec is not mandatory for every change. Use the full
+  explore -> change -> tasks -> verify -> archive flow only when a change
+  touches VM lifecycle (create/stop/suspend/restore/delete), data integrity
+  (snapshot/restore correctness, guest memory handling), or a cross-crate
+  contract (proto/, or the vmm<->orch wire protocol). Everything else is
+  engineer judgment - do not force process onto small, contained changes.
+
+  TDD is required for vmm/ and orch/ (Rust, security-critical system layer):
+  write a test that reproduces the real failure first, then fix it. This is
+  not a coverage-chasing exercise - tests should target actual failure modes
+  (e.g. a memory round-trip that corrupts under a specific VM size), not
+  padding for a percentage.
+
+# Per-artifact rules
+rules:
+  proposal:
+    - Proposals for changes touching VM lifecycle/data-integrity/cross-crate
+      contracts must include a "Data-loss / rollback" section describing what
+      happens to in-flight VM state and guest disks if the change misbehaves.
+    - Include a "Non-goals" section listing what this change will NOT implement.
+  tasks:
+    - For vmm/ and orch/ changes, the first task must be "write a failing
+      test that reproduces the bug/gap" before any implementation task.
+
+# Per-operation guidance
+operations:
+  verify:
+    guidance:
+      - For vmm/orch changes, verification must include actually running the
+        relevant cargo test suite (and, where the change touches
+        snapshot/live-snapshot/restore, the vmm/ci/*.sh gate scripts under
+        real KVM) - not just a code read-through.

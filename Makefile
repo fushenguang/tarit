@@ -16,7 +16,7 @@ CARGO ?= cargo
 # On macOS, build the host-only paths with `make VMM_FEATURES=`.
 VMM_FEATURES ?= boot
 
-.PHONY: all build vmm taritd agent install install-vmm guest clean
+.PHONY: all build vmm taritd agent install install-vmm guest clean coverage
 
 # Build both binaries and the guest agent (default).
 all: build
@@ -58,3 +58,9 @@ clean:
 	$(CARGO) clean --manifest-path vmm/Cargo.toml
 	$(CARGO) clean --manifest-path orch/Cargo.toml
 	$(MAKE) -C vmm/guest/agent clean
+
+# Rust line coverage for vmm-core (needs `cargo install cargo-llvm-cov` +
+# `rustup component add llvm-tools-preview`). See README.md's "Test coverage"
+# section for how to read the numbers.
+coverage:
+	cd vmm && $(CARGO) llvm-cov --features boot -p vmm-core --summary-only

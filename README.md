@@ -22,6 +22,23 @@ dependency-light crate, **`proto/`** (`tarit-proto`). That crate is the wire
 contract, so you can drive the VMM from `taritd` or from your own control plane
 without hand-copying types.
 
+## About this fork
+
+This is an independent fork of [instavm/tarit](https://github.com/instavm/tarit),
+maintained separately going forward rather than tracked toward upstream
+mergeability. instavm/tarit is where this project's design — the VMM, the
+orchestrator, the whole approach — came from, and we're grateful for it; this
+fork exists to move at the pace our own production use demands, not because
+of any disagreement with the original. We keep watching upstream for
+security-relevant fixes in the rust-vmm/KVM/virtio layer and port those back
+manually, even though we're not syncing everything.
+
+This fork is, and will stay, open source under the same license
+([AGPL-3.0-or-later](LICENSE)) as the project it came from. That's not
+changing — no closed-source fork, no relicensing, no rug pull. If something
+here is useful to you, it's yours to use, read, and build on, same as the
+original always was.
+
 ## Why microVMs
 
 - **Hardware virtualization.** Each sandbox is a KVM guest with its own kernel,
@@ -42,6 +59,30 @@ commit. Run `vmm/ci/perf-gates.sh` for the VMM lifecycle gates and
 result should include the commit, host and guest configuration, artifact
 identities, iteration count, percentile method, and raw report; unversioned
 headline numbers are not treated as release evidence.
+
+## Test coverage
+
+`vmm-core` carries the VM lifecycle and data-integrity logic (create, snapshot,
+restore, suspend, live-snapshot) and is the one crate in this fork with a
+standing test-driven-development requirement: a bug fix here starts with a
+test that reproduces the real failure (see `split_guest_memory_round_trips_*`
+in `controller.rs` — that test exists because that exact bug shipped once).
+
+Measured on commit `18bee49` (2026-07-29) via
+`cargo llvm-cov --features boot -p vmm-core --summary-only` (`make coverage`):
+**36.9% line coverage** (73 unit tests, all passing) across `vmm-core`.
+That number undercounts real coverage of the security-critical path: modules
+like `kvm.rs`, `vcpu_thread.rs`, `vsock_pty.rs`, and `vsock_exec.rs` show 0%
+here because they only run inside a real booted guest, which `cargo test`
+doesn't do — they're instead exercised by `vmm/ci/*.sh` (`livesnap-gate.sh`
+and friends), real-KVM integration gates that verify actual snapshot/restore
+byte-for-byte correctness rather than line coverage. Both numbers matter; a
+unit-test percentage alone would understate what's actually checked, so we
+report both rather than picking the one that looks better.
+
+Regenerate with `make coverage` (needs `cargo install cargo-llvm-cov` +
+`rustup component add llvm-tools-preview`), or drop `-p vmm-core` for a
+workspace-wide number.
 
 ## Architecture at a glance
 
