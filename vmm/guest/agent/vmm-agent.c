@@ -51,6 +51,13 @@
  * init on an OCI-derived rootfs where no login shell exported one. */
 #define DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+/* If a regular, executable file exists here at agent startup, it is launched
+ * once per guest boot with no host trigger required -- this is what lets a
+ * workload survive a VM stop/start cycle (the file lives on the VM's overlay
+ * disk, which vm-stop-delete-split retains across stop/start and restart). */
+#define AUTOSTART_PATH "/etc/vmm-agent/autostart"
+#define AUTOSTART_LOG_PATH "/var/log/vmm-agent-autostart.log"
+
 static int write_all(int fd, const void *buf, size_t len) {
     const unsigned char *p = (const unsigned char *)buf;
     while (len > 0) {
@@ -206,6 +213,61 @@ static void setup_as_init(void) {
 static void reap_orphans(void) {
     while (waitpid(-1, NULL, WNOHANG) > 0) {
     }
+}
+
+/* Run a guest-provided autostart script once, if present and executable, so a
+ * workload (e.g. a long-running server) survives a VM stop/start cycle with
+ * no host-side re-trigger: the script lives at a well-known path on the
+ * VM's overlay disk, which vm-stop-delete-split retains across stop/start,
+ * so it is still there the next time the guest boots and this same check
+ * runs again.
+ *
+ * The child fully detaches (new session, stdio redirected away from the
+ * serial fd) before exec so it can run for the rest of the VM's life without
+ * ever touching serial -- if it inherited that fd, its own output would
+ * interleave with the VMM_EXEC/PTY wire protocol framing and corrupt both.
+ * We do not wait for it here; it is reaped like any other orphan (by
+ * reap_orphans() when we are PID 1, or by whatever real init is otherwise). */
+static void run_autostart_if_present(void) {
+    struct stat st;
+    if (stat(AUTOSTART_PATH, &st) != 0) {
+        return;
+    }
+    if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0) {
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid != 0) {
+        return;
+    }
+
+    if (setsid() < 0) {
+        _exit(127);
+    }
+
+    int devnull_in = open("/dev/null", O_RDONLY);
+    if (devnull_in >= 0) {
+        dup2(devnull_in, STDIN_FILENO);
+        if (devnull_in != STDIN_FILENO) {
+            close(devnull_in);
+        }
+    }
+
+    int logfd = open(AUTOSTART_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0640);
+    if (logfd < 0) {
+        logfd = open("/dev/null", O_WRONLY);
+    }
+    if (logfd >= 0) {
+        dup2(logfd, STDOUT_FILENO);
+        dup2(logfd, STDERR_FILENO);
+        if (logfd != STDOUT_FILENO && logfd != STDERR_FILENO) {
+            close(logfd);
+        }
+    }
+
+    execl(AUTOSTART_PATH, AUTOSTART_PATH, (char *)NULL);
+    _exit(127);
 }
 
 static void make_raw(int fd) {
@@ -922,6 +984,8 @@ int main(void) {
      * (the controller can wait for this before sending the first VMM_EXEC),
      * and doubles as a diagnostic that the agent started + serial output works. */
     (void)serial_write(serial_fd, "VMM_AGENT_READY\n", 16);
+
+    run_autostart_if_present();
 
     char line[LINE_MAX_LEN];
     for (;;) {
