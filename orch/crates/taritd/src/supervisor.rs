@@ -109,7 +109,7 @@ enum ReadinessCheck {
     Resume,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct VmSpawnConfig {
     pub memory_mib: u64,
     pub vcpus: u8,
@@ -119,6 +119,42 @@ pub struct VmSpawnConfig {
     /// Mount the rootfs read-only (shared immutable base). Set from
     /// `Config::rootfs_read_only` so warm VMs and requests agree.
     pub read_only: bool,
+    /// Carried through to the created `VmRecord` unchanged; not a boot
+    /// parameter, but threaded here so `creating_record`/`running_record`
+    /// (which only receive `VmSpawnConfig`) can read it without a new param.
+    ///
+    /// Deliberately excluded from `PartialEq`/`Eq`/`Hash` below: warm-pool
+    /// matching (`take_warm_with_publication`) compares a request's
+    /// `VmSpawnConfig` against a pre-provisioned warm VM's boot-shape config,
+    /// and a warm VM has no meaningful restart_policy of its own (its final
+    /// value always comes from the claiming request). Including it in the
+    /// comparison would make a warm VM never match a request that sets
+    /// `restart_policy: Always`, silently forcing a cold boot instead.
+    pub restart_policy: tarit_types::RestartPolicy,
+}
+
+impl PartialEq for VmSpawnConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.memory_mib == other.memory_mib
+            && self.vcpus == other.vcpus
+            && self.kernel_path == other.kernel_path
+            && self.rootfs_path == other.rootfs_path
+            && self.cmdline == other.cmdline
+            && self.read_only == other.read_only
+    }
+}
+
+impl Eq for VmSpawnConfig {}
+
+impl std::hash::Hash for VmSpawnConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.memory_mib.hash(state);
+        self.vcpus.hash(state);
+        self.kernel_path.hash(state);
+        self.rootfs_path.hash(state);
+        self.cmdline.hash(state);
+        self.read_only.hash(state);
+    }
 }
 
 impl VmSpawnConfig {
@@ -150,6 +186,7 @@ impl VmSpawnConfig {
             rootfs_path,
             cmdline,
             read_only: config.rootfs_read_only,
+            restart_policy: req.restart_policy,
         }
     }
 
@@ -170,6 +207,11 @@ impl VmSpawnConfig {
             rootfs_path,
             cmdline: DEFAULT_CMDLINE.to_string(),
             read_only: config.rootfs_read_only,
+            // Warm-pool provisioning only uses this config to pre-boot a
+            // generic VM for later matching; the claiming request's own
+            // `from_defaults`-derived config (with its real restart_policy)
+            // is what actually populates the claimed VM's record.
+            restart_policy: tarit_types::RestartPolicy::No,
         }
     }
 }
@@ -4517,6 +4559,7 @@ mod tests {
             rootfs_path,
             cmdline: DEFAULT_CMDLINE.to_string(),
             read_only,
+            restart_policy: tarit_types::RestartPolicy::No,
         }
     }
 
@@ -4584,6 +4627,7 @@ mod tests {
             status: VmStatus::Running,
             revision: 7,
             startup_path: None,
+            restart_policy: tarit_types::RestartPolicy::No,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),

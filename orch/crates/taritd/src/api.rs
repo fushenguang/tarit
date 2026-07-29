@@ -67,9 +67,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use tarit_store::Store;
 use tarit_types::{
     AuditEvent, CreateShareRequest, CreateVmRequest, EgressUpdateRequest, ErrorBody,
-    ExecuteRequest, ExecutionRecord, ExecutionStatus, OrchError, PublicVmRecord, ShareRecord,
-    ShareTokenResponse, ShareVisibility, SnapshotRequest, UpdateShareRequest, UsageEvent,
-    UsageSummary, VmRecord, VmStatus,
+    ExecuteRequest, ExecutionRecord, ExecutionStatus, OrchError, PublicVmRecord, RestartPolicy,
+    ShareRecord, ShareTokenResponse, ShareVisibility, SnapshotRequest, UpdateShareRequest,
+    UsageEvent, UsageSummary, VmRecord, VmStatus,
 };
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -1360,6 +1360,7 @@ pub(crate) fn running_record(
         status: VmStatus::Running,
         revision: 1,
         startup_path: None,
+        restart_policy: spawn_cfg.restart_policy,
         memory_mib: spawn_cfg.memory_mib,
         vcpus: spawn_cfg.vcpus,
         kernel_path: spawn_cfg.kernel_path.display().to_string(),
@@ -2764,6 +2765,7 @@ mod tests {
             image: None,
             rootfs_path: None,
             cmdline: None,
+            restart_policy: RestartPolicy::No,
         };
         assert!(matches!(
             enforce_create_path_policy(&user, &req),
@@ -3783,6 +3785,7 @@ mod tests {
             status,
             revision: 1,
             startup_path: None,
+            restart_policy: RestartPolicy::No,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),

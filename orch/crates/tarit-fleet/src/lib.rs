@@ -7,8 +7,8 @@ use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use rustls::{ClientConfig, RootCertStore};
 use tarit_store::HostRecord;
 use tarit_types::{
-    AuditEvent, ExecutionRecord, ExecutionStatus, ShareRecord, ShareVisibility, UsageEvent,
-    UsageSummary, VmRecord, VmStartupPath, VmStatus,
+    AuditEvent, ExecutionRecord, ExecutionStatus, RestartPolicy, ShareRecord, ShareVisibility,
+    UsageEvent, UsageSummary, VmRecord, VmStartupPath, VmStatus,
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
@@ -67,6 +67,7 @@ impl PostgresFleet {
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS api_key_id TEXT;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS startup_path TEXT;
+             ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS restart_policy TEXT NOT NULL DEFAULT 'no';
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
              CREATE INDEX IF NOT EXISTS fleet_vms_owner_status ON fleet_vms (owner_key, status);
              CREATE TABLE IF NOT EXISTS fleet_schema_migrations (
@@ -148,15 +149,17 @@ impl PostgresFleet {
         let row = tx
             .query_opt(
                 "INSERT INTO fleet_vms (
-                   id, host_id, owner_key, api_key_id, status, revision, startup_path, memory_mib, vcpus,
-                   kernel_path, rootfs_path, cmdline, created_at, updated_at, generation
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1)
+                   id, host_id, owner_key, api_key_id, status, revision, startup_path,
+                   restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
+                   created_at, updated_at, generation
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1)
                  ON CONFLICT (id) DO UPDATE SET
                    owner_key = EXCLUDED.owner_key,
                    api_key_id = EXCLUDED.api_key_id,
                    status = EXCLUDED.status,
                    revision = EXCLUDED.revision,
                    startup_path = EXCLUDED.startup_path,
+                   restart_policy = EXCLUDED.restart_policy,
                    memory_mib = EXCLUDED.memory_mib,
                    vcpus = EXCLUDED.vcpus,
                    kernel_path = EXCLUDED.kernel_path,
@@ -177,6 +180,7 @@ impl PostgresFleet {
                     &i64::try_from(vm.revision)
                         .map_err(|_| FleetError::Config("VM revision exceeds PostgreSQL BIGINT".into()))?,
                     &vm.startup_path.map(VmStartupPath::as_str),
+                    &vm.restart_policy.as_str(),
                     &(vm.memory_mib as i64),
                     &(vm.vcpus as i16),
                     &vm.kernel_path,
@@ -193,7 +197,7 @@ impl PostgresFleet {
                 let existing = tx
                     .query_opt(
                         "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                                memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
+                                restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
                                 created_at, updated_at, generation
                            FROM fleet_vms WHERE id = $1",
                         &[&vm.id],
@@ -239,7 +243,8 @@ impl PostgresFleet {
         let rows = client
             .query(
                 "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                        memory_mib, vcpus, kernel_path, rootfs_path, cmdline, created_at, updated_at
+                        restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
+                        created_at, updated_at
                    FROM fleet_vms
                  WHERE ($1::TEXT IS NULL OR owner_key = $1)
                    AND status <> 'stopped'
@@ -913,9 +918,10 @@ fn row_to_vm(row: &tokio_postgres::Row) -> Result<VmRecord, FleetError> {
     let revision = u64::try_from(row.get::<_, i64>(5))
         .map_err(|_| FleetError::Config("negative VM revision in fleet row".into()))?;
     let startup_path: Option<String> = row.get(6);
-    let memory_mib = u64::try_from(row.get::<_, i64>(7))
+    let restart_policy: String = row.get(7);
+    let memory_mib = u64::try_from(row.get::<_, i64>(8))
         .map_err(|_| FleetError::Config("negative VM memory in fleet row".into()))?;
-    let vcpus = u8::try_from(row.get::<_, i16>(8))
+    let vcpus = u8::try_from(row.get::<_, i16>(9))
         .map_err(|_| FleetError::Config("invalid VM vCPU count in fleet row".into()))?;
     Ok(VmRecord {
         id: row.get(0),
@@ -927,17 +933,18 @@ fn row_to_vm(row: &tokio_postgres::Row) -> Result<VmRecord, FleetError> {
         })?,
         revision,
         startup_path: startup_path.as_deref().and_then(VmStartupPath::parse),
+        restart_policy: RestartPolicy::parse(&restart_policy).unwrap_or_default(),
         memory_mib,
         vcpus,
-        kernel_path: row.get(9),
-        rootfs_path: row.get(10),
-        cmdline: row.get(11),
+        kernel_path: row.get(10),
+        rootfs_path: row.get(11),
+        cmdline: row.get(12),
         // Process handles are node-local and must never be reconstructed from
         // the global ownership index.
         socket_path: None,
         pid: None,
-        created_at: row.get(12),
-        updated_at: row.get(13),
+        created_at: row.get(13),
+        updated_at: row.get(14),
     })
 }
 
@@ -1139,6 +1146,7 @@ mod tests {
             status: VmStatus::Creating,
             revision: 1,
             startup_path: None,
+            restart_policy: RestartPolicy::No,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "/opt/tarit/vmlinux".into(),

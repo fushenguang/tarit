@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tarit_types::{CreateVmRequest, OrchError, VmRecord, VmStartupPath, VmStatus};
+use tarit_types::{CreateVmRequest, OrchError, RestartPolicy, VmRecord, VmStartupPath, VmStatus};
 use uuid::Uuid;
 
 use crate::api::{
@@ -845,6 +845,7 @@ fn creating_record(
         status: VmStatus::Creating,
         revision: 1,
         startup_path: None,
+        restart_policy: spawn_cfg.restart_policy,
         memory_mib: spawn_cfg.memory_mib,
         vcpus: spawn_cfg.vcpus,
         kernel_path: spawn_cfg.kernel_path.display().to_string(),
@@ -1301,6 +1302,7 @@ async fn restore_local_owned(
         rootfs_path: snapshot.rootfs_path.clone().map(Into::into),
         cmdline: cmdline.clone(),
         read_only: true,
+        restart_policy: RestartPolicy::No,
     };
     let now = Utc::now();
     let record = VmRecord {
@@ -1311,6 +1313,7 @@ async fn restore_local_owned(
         status: VmStatus::Creating,
         revision: 1,
         startup_path: Some(VmStartupPath::SnapshotRestore),
+        restart_policy: RestartPolicy::No,
         memory_mib,
         vcpus,
         kernel_path,
@@ -2760,6 +2763,7 @@ mod tests {
             rootfs_path: Some(PathBuf::from("rootfs")),
             cmdline: "console=ttyS0".into(),
             read_only: false,
+            restart_policy: RestartPolicy::No,
         };
         let runtime = test_runtime();
 
@@ -2872,6 +2876,7 @@ mod tests {
                 image: None,
                 rootfs_path: None,
                 cmdline: None,
+                restart_policy: RestartPolicy::No,
             },
         );
         let id = Uuid::new_v4();
@@ -2904,6 +2909,7 @@ mod tests {
                         image: None,
                         rootfs_path: None,
                         cmdline: None,
+                        restart_policy: RestartPolicy::No,
                     },
                 )
                 .await
@@ -2951,6 +2957,7 @@ mod tests {
             rootfs_path: Some(PathBuf::from("rootfs")),
             cmdline: "console=ttyS0".into(),
             read_only: false,
+            restart_policy: RestartPolicy::No,
         };
         let id = Uuid::new_v4();
         state
@@ -3151,6 +3158,7 @@ mod tests {
                 status: VmStatus::Running,
                 revision: 1,
                 startup_path: None,
+                restart_policy: RestartPolicy::No,
                 memory_mib: 256,
                 vcpus: 1,
                 kernel_path: "kernel".into(),

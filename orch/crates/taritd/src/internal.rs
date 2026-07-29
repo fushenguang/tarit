@@ -25,7 +25,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tarit_types::{CreateVmRequest, EgressUpdateRequest, RestoreRequest, VmRecord};
+use tarit_types::{CreateVmRequest, EgressUpdateRequest, RestartPolicy, RestoreRequest, VmRecord};
 use uuid::Uuid;
 
 use crate::{
@@ -645,6 +645,7 @@ mod tests {
             status: VmStatus::Running,
             revision: 1,
             startup_path: Some(tarit_types::VmStartupPath::Cold),
+            restart_policy: RestartPolicy::No,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "/tmp/vmlinux".into(),
