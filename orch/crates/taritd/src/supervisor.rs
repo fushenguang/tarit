@@ -4689,6 +4689,51 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // Regression test for the vm-stop-delete-split change: quarantining a
+    // re-adopted VM whose runtime state couldn't be observed must not destroy
+    // its private overlay disk. Today `quarantine_readopted_runtime` routes
+    // through the destructive `stop_vm` -> `teardown_vm` path, so this
+    // currently fails; it must pass once stop/purge are split.
+    #[test]
+    fn quarantine_readopted_runtime_retains_overlay_disk() {
+        let root = PathBuf::from(format!(
+            "target/taritd-restart-quarantine-retains-overlay-{}",
+            Uuid::new_v4()
+        ));
+        let socket_path = root.join("missing-vmm.sock");
+        let supervisor = Arc::new(VmmSupervisor::new(supervisor_config(&root)));
+        let id = Uuid::new_v4();
+        let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        supervisor
+            .scheduler
+            .reserve_existing(id, ResourceShape::new(1, 256))
+            .unwrap();
+        supervisor.running.lock().unwrap().insert(
+            id,
+            RunningVm::new(process.pid, socket_path.clone(), process, None),
+        );
+        let overlay_path = PathBuf::from(supervisor.overlay_path_for(id));
+        std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        std::fs::write(&overlay_path, b"private vm overlay contents").unwrap();
+        let mut record = restart_record(id, &socket_path);
+
+        let error = test_runtime()
+            .block_on(supervisor.reconcile_readopted_status(&mut record))
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ReadoptFailure::Unadoptable(_)),
+            "unobservable runtime must be reported as unadoptable, not fatal: {error}"
+        );
+        assert!(
+            overlay_path.exists(),
+            "quarantining a re-adopted VM whose runtime state could not be observed \
+             must retain its private overlay disk, not delete it"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn restart_reconciliation_propagates_quarantine_cleanup_failure() {
         let root = PathBuf::from(format!(
@@ -4866,6 +4911,88 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Regression test for the vm-stop-delete-split change: DELETE and every
+    // other "stop" caller shares this exact entry point (`stop_vm`), so
+    // pinning it here pins the bug for all of them. Today `stop_vm` routes
+    // through the destructive `teardown_vm`, so this currently fails; it must
+    // pass once `stop_vm` is the non-destructive half of the split and the
+    // destructive behavior moves to a distinctly-named `purge_vm`.
+    #[test]
+    fn stop_vm_retains_overlay_disk() {
+        let root = PathBuf::from(format!(
+            "target/taritd-stop-retains-overlay-{}",
+            Uuid::new_v4()
+        ));
+        let socket_path = PathBuf::from(format!(
+            "target/taritd-stop-retains-overlay-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test VMM socket");
+        listener
+            .set_nonblocking(true)
+            .expect("make test VMM socket nonblocking");
+        let process = ManagedProcess::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn test VMM process"),
+        );
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut length = [0; 4];
+                        stream.read_exact(&mut length).expect("read request length");
+                        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                        stream.read_exact(&mut body).expect("read request body");
+                        let _: tarit_vmm_client::ApiRequest =
+                            serde_json::from_slice(&body).expect("decode request");
+                        let response =
+                            serde_json::to_vec(&tarit_vmm_client::ApiResponse::Ok).unwrap();
+                        stream
+                            .write_all(&(response.len() as u32).to_be_bytes())
+                            .expect("write response length");
+                        stream.write_all(&response).expect("write response body");
+                        stream.flush().expect("flush response");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+        let id = Uuid::new_v4();
+        let overlay_path = PathBuf::from(supervisor.overlay_path_for(id));
+        std::fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        std::fs::write(&overlay_path, b"private vm overlay contents").unwrap();
+
+        supervisor.running.lock().unwrap().insert(
+            id,
+            RunningVm::new(process.pid, socket_path.clone(), process, None),
+        );
+
+        supervisor.stop_vm(id).expect("stop_vm must succeed");
+        server.join().expect("join test VMM server");
+
+        assert!(
+            overlay_path.exists(),
+            "stop_vm must retain the VM's private overlay disk, not delete it"
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_dir_all(root);
     }
 
