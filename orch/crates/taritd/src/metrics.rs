@@ -755,7 +755,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, RwLock};
     use tarit_store::Store;
-    use tarit_types::VmRecord;
+    use tarit_types::{RestartPolicy, VmRecord};
     use uuid::Uuid;
 
     #[test]
@@ -777,6 +777,7 @@ mod tests {
                 status: VmStatus::Running,
                 revision: 1,
                 startup_path: None,
+                restart_policy: RestartPolicy::No,
                 memory_mib: 256,
                 vcpus: 1,
                 kernel_path: "kernel".into(),

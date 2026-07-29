@@ -783,6 +783,49 @@ impl PeerClient {
         Ok(())
     }
 
+    /// Stop and permanently purge a VM's overlay disk + record on the
+    /// owning peer - `DELETE ...?force=true`'s remote counterpart.
+    pub fn purge_remote(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<(), OrchError> {
+        let path = format!("/internal/v1/vms/{vm_id}?force=true");
+        let req = self.empty_request(target, reqwest::Method::DELETE, &path, Some(identity))?;
+        let resp = req
+            .send()
+            .map_err(|e| OrchError::Internal(format!("peer purge request: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            if status.as_u16() == 404 {
+                return Err(OrchError::NotFound("peer purge: vm not found".into()));
+            }
+            if status.as_u16() == 403 {
+                return Err(OrchError::Forbidden("peer purge: forbidden".into()));
+            }
+            return Err(OrchError::Internal(format!("peer purge HTTP {status}")));
+        }
+        Ok(())
+    }
+
+    /// Cold-start a `Stopped` VM on the owning peer, reusing its retained
+    /// overlay disk - vm-restart's remote counterpart.
+    pub fn start_remote(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<VmRecord, OrchError> {
+        self.post_json(
+            target,
+            &format!("/internal/v1/vms/{vm_id}/start"),
+            &serde_json::json!({}),
+            Some(identity),
+            "start",
+        )
+    }
+
     fn insert_signed_identity_headers(
         &self,
         headers: &mut HeaderMap,

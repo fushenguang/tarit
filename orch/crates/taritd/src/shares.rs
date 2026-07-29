@@ -627,8 +627,8 @@ mod tests {
     };
     use tarit_store::Store;
     use tarit_types::{
-        CreateShareRequest, OrchError, ShareRecord, ShareVisibility, UpdateShareRequest, VmRecord,
-        VmStatus,
+        CreateShareRequest, OrchError, RestartPolicy, ShareRecord, ShareVisibility,
+        UpdateShareRequest, VmRecord, VmStatus,
     };
     use uuid::Uuid;
 
@@ -1030,6 +1030,7 @@ mod tests {
             status,
             revision: 1,
             startup_path: None,
+            restart_policy: RestartPolicy::No,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),

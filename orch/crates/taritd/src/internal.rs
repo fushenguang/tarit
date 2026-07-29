@@ -8,7 +8,7 @@
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{DefaultBodyLimit, Extension, Path, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{HeaderMap, Request, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -115,6 +115,7 @@ pub fn internal_router(state: AppState) -> Router {
         )
         .route("/internal/v1/vms/{id}/status", get(internal_status))
         .route("/internal/v1/vms/{id}/exec", post(internal_exec))
+        .route("/internal/v1/vms/{id}/start", post(internal_start))
         .route("/internal/v1/vms/{id}/pause", post(internal_pause))
         .route("/internal/v1/vms/{id}/suspend", post(internal_suspend))
         .route("/internal/v1/vms/{id}/resume", post(internal_resume))
@@ -549,14 +550,34 @@ async fn internal_exec(
     })))
 }
 
+#[derive(Deserialize, Default)]
+pub struct InternalDeleteQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 async fn internal_stop(
     State(state): State<AppState>,
     identity: Option<Extension<ApiIdentity>>,
     Path(id): Path<Uuid>,
+    Query(q): Query<InternalDeleteQuery>,
 ) -> Result<StatusCode, ApiError> {
     enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
-    ops::stop_local(&state, id).await?;
+    if q.force {
+        ops::purge_local(&state, id).await?;
+    } else {
+        ops::stop_local(&state, id).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn internal_start(
+    State(state): State<AppState>,
+    identity: Option<Extension<ApiIdentity>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<InternalVmRecord>, ApiError> {
+    enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
+    Ok(Json(ops::start_local(&state, id).await?.into()))
 }
 
 async fn internal_get(
@@ -634,7 +655,7 @@ async fn internal_egress(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use tarit_types::VmStatus;
+    use tarit_types::{RestartPolicy, VmStatus};
 
     fn sample_record() -> VmRecord {
         VmRecord {
@@ -645,6 +666,7 @@ mod tests {
             status: VmStatus::Running,
             revision: 1,
             startup_path: Some(tarit_types::VmStartupPath::Cold),
+            restart_policy: RestartPolicy::No,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "/tmp/vmlinux".into(),

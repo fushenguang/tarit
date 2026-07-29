@@ -8,6 +8,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// Lifecycle state of a microVM on a host.
+///
+/// `Stopped` means the guest process is not running but its private overlay
+/// disk and this store record are retained and available for a future start
+/// (via the vm-restart capability) - it does NOT mean the disk has been
+/// deleted. Only an explicit force-delete removes the disk and the record
+/// entirely (see the vm-delete capability).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VmStatus {
@@ -15,6 +21,7 @@ pub enum VmStatus {
     Running,
     Paused,
     Suspended,
+    /// Guest process stopped; overlay disk and record retained (recoverable).
     Stopped,
     Error,
 }
@@ -75,6 +82,38 @@ impl VmStartupPath {
     }
 }
 
+/// Whether a VM should be automatically cold-started (reusing its retained
+/// overlay disk) after taritd starts up and finds it `Stopped` - the
+/// Docker-`--restart`-like recovery behavior from the vm-restart capability.
+///
+/// Only `No`/`Always` are supported: `on-failure`/`unless-stopped`-style
+/// policies would need health-check infrastructure this project doesn't have
+/// yet, so they are an explicit non-goal for now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartPolicy {
+    #[default]
+    No,
+    Always,
+}
+
+impl RestartPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Always => "always",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "no" => Some(Self::No),
+            "always" => Some(Self::Always),
+            _ => None,
+        }
+    }
+}
+
 /// Persistent record of a VM managed by taritd.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmRecord {
@@ -93,6 +132,11 @@ pub struct VmRecord {
     /// created by versions predating launch provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_path: Option<VmStartupPath>,
+    /// Whether taritd should automatically cold-start this VM after finding
+    /// it `Stopped` post-startup. Defaults to `No` for records predating this
+    /// field.
+    #[serde(default)]
+    pub restart_policy: RestartPolicy,
     pub memory_mib: u64,
     pub vcpus: u8,
     pub kernel_path: String,
@@ -121,6 +165,8 @@ pub struct PublicVmRecord {
     pub revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_path: Option<VmStartupPath>,
+    #[serde(default)]
+    pub restart_policy: RestartPolicy,
     pub memory_mib: u64,
     pub vcpus: u8,
     pub created_at: DateTime<Utc>,
@@ -134,6 +180,7 @@ impl From<&VmRecord> for PublicVmRecord {
             status: record.status,
             revision: record.revision,
             startup_path: record.startup_path,
+            restart_policy: record.restart_policy,
             memory_mib: record.memory_mib,
             vcpus: record.vcpus,
             created_at: record.created_at,
@@ -255,6 +302,9 @@ pub struct CreateVmRequest {
     pub image: Option<String>,
     pub rootfs_path: Option<String>,
     pub cmdline: Option<String>,
+    /// See [`RestartPolicy`]. Defaults to `No` when omitted.
+    #[serde(default)]
+    pub restart_policy: RestartPolicy,
 }
 
 fn default_memory_mib() -> u64 {
@@ -405,6 +455,8 @@ pub struct AuditEvent {
 pub mod audit_action {
     pub const CREATE: &str = "create";
     pub const DELETE: &str = "delete";
+    pub const STOP: &str = "stop";
+    pub const START: &str = "start";
     pub const PAUSE: &str = "pause";
     pub const SUSPEND: &str = "suspend";
     pub const RESUME: &str = "resume";
@@ -628,6 +680,7 @@ mod tests {
             status: VmStatus::Running,
             revision: 2,
             startup_path: Some(VmStartupPath::Cold),
+            restart_policy: RestartPolicy::No,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "/srv/private/vmlinux".into(),

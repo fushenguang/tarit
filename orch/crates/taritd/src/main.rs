@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use supervisor::VmmSupervisor;
 use tarit_store::Store;
-use tarit_types::VmStatus;
+use tarit_types::{RestartPolicy, VmStatus};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -388,6 +388,15 @@ async fn run_server(
             }
         })
     };
+    // Cold-start every restart_policy=always VM this readopt pass left
+    // Stopped (docker-`--restart=always`-like recovery). Spawned rather than
+    // awaited so a host with many such VMs doesn't delay the HTTP listener
+    // from serving; must run after store_writer above so start_local's
+    // durable-write awaits actually get acked instead of hanging.
+    {
+        let sweep_state = state.clone();
+        tokio::spawn(async move { restart_policy_sweep(&sweep_state).await });
+    }
     let warm_pool = warmpool::spawn_replenisher(
         Arc::clone(&supervisor),
         config.clone(),
@@ -915,6 +924,74 @@ async fn shutdown_signal() -> &'static str {
     "SIGINT"
 }
 
+/// Cold-start every locally-owned `Stopped` VM with `restart_policy = always`
+/// whose overlay disk is still present, via the same `ops::start_local` path
+/// (and thus the same scheduler capacity bound) a manual `POST .../start`
+/// uses. Runs once at taritd startup, after `readopt_running_vms` has
+/// already reclaimed any VM whose vmm process survived this restart - by
+/// construction this sweep only ever sees VMs genuinely left `Stopped`, not
+/// ones readopt already reclaimed as `Running`. A per-VM failure (capacity
+/// exhausted, corrupt overlay) is logged and does not stop the sweep from
+/// continuing to the next candidate, nor does it crash-loop taritd itself.
+async fn restart_policy_sweep(state: &AppState) {
+    let candidates: Vec<Uuid> = {
+        let cache = match state.vm_cache.read() {
+            Ok(cache) => cache,
+            Err(_) => {
+                tracing::error!("restart_policy sweep: vm cache lock poisoned, skipping");
+                return;
+            }
+        };
+        restart_policy_candidates(cache.values(), &state.config.host_id)
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = candidates.len(),
+        "restart_policy sweep: starting always-policy VMs left stopped"
+    );
+    let mut started = 0usize;
+    let mut failed = 0usize;
+    for id in candidates {
+        match ops::start_local(state, id).await {
+            Ok(_) => {
+                started += 1;
+                tracing::info!(vm = %id, "restart_policy sweep: started");
+            }
+            Err(error) => {
+                failed += 1;
+                tracing::warn!(
+                    vm = %id,
+                    %error,
+                    "restart_policy sweep: could not start (left as-is; retry via a manual start or the next taritd restart)"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        started,
+        failed,
+        "restart_policy sweep: complete"
+    );
+}
+
+/// Pure selection logic for `restart_policy_sweep`, split out so the
+/// filtering criteria (this host, `Stopped`, `restart_policy = always`) are
+/// unit-testable without a real `AppState`/store/scheduler.
+fn restart_policy_candidates<'a>(
+    vms: impl Iterator<Item = &'a tarit_types::VmRecord>,
+    host_id: &str,
+) -> Vec<Uuid> {
+    vms.filter(|vm| {
+        vm.host_id == host_id
+            && vm.status == VmStatus::Stopped
+            && vm.restart_policy == RestartPolicy::Always
+    })
+    .map(|vm| vm.id)
+    .collect()
+}
+
 async fn shutdown_sweep(state: &AppState, reason: &'static str) -> anyhow::Result<()> {
     let started = Instant::now();
     if !state.config.reap_on_shutdown {
@@ -995,6 +1072,55 @@ mod tests {
 
     fn test_shutdown(tx: watch::Sender<Option<&'static str>>) -> ShutdownCoordinator {
         ShutdownCoordinator::new(tx, Arc::new(VmmSupervisor::new(test_config())))
+    }
+
+    fn sweep_test_vm(
+        host_id: &str,
+        status: VmStatus,
+        restart_policy: RestartPolicy,
+    ) -> tarit_types::VmRecord {
+        let now = chrono::Utc::now();
+        tarit_types::VmRecord {
+            id: Uuid::new_v4(),
+            host_id: host_id.into(),
+            owner_key: None,
+            api_key_id: None,
+            status,
+            revision: 1,
+            startup_path: None,
+            restart_policy,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "kernel".into(),
+            rootfs_path: None,
+            cmdline: "console=ttyS0".into(),
+            socket_path: None,
+            pid: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn restart_policy_candidates_selects_only_this_hosts_stopped_always_vms() {
+        let wanted = sweep_test_vm("this-host", VmStatus::Stopped, RestartPolicy::Always);
+        let wrong_status = sweep_test_vm("this-host", VmStatus::Running, RestartPolicy::Always);
+        let wrong_policy = sweep_test_vm("this-host", VmStatus::Stopped, RestartPolicy::No);
+        let wrong_host = sweep_test_vm("other-host", VmStatus::Stopped, RestartPolicy::Always);
+        let vms = [
+            wanted.clone(),
+            wrong_status,
+            wrong_policy,
+            wrong_host,
+        ];
+
+        let candidates = restart_policy_candidates(vms.iter(), "this-host");
+
+        assert_eq!(
+            candidates,
+            vec![wanted.id],
+            "only this host's Stopped+restart_policy=always VM must be selected"
+        );
     }
 
     #[tokio::test]

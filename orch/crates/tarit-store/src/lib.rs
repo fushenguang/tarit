@@ -5,8 +5,8 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
 use tarit_types::{
-    AuditEvent, ExecutionRecord, ExecutionStatus, ShareRecord, ShareVisibility, SshKeyRecord,
-    UsageEvent, UsageKind, VmRecord, VmStartupPath, VmStatus,
+    AuditEvent, ExecutionRecord, ExecutionStatus, RestartPolicy, ShareRecord, ShareVisibility,
+    SshKeyRecord, UsageEvent, UsageKind, VmRecord, VmStartupPath, VmStatus,
 };
 use uuid::Uuid;
 
@@ -229,6 +229,12 @@ impl Store {
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
         ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "vms", "startup_path", "TEXT")?;
+        ensure_column(
+            &conn,
+            "vms",
+            "restart_policy",
+            "TEXT NOT NULL DEFAULT 'no'",
+        )?;
         ensure_column(&conn, "snapshots", "memory_mib", "INTEGER")?;
         ensure_column(&conn, "snapshots", "overlay_path", "TEXT")?;
         ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
@@ -245,15 +251,17 @@ impl Store {
     pub fn insert_vm(&self, vm: &VmRecord) -> Result<(), StoreError> {
         let changed = self.conn.execute(
             "INSERT INTO vms (
-              id, host_id, owner_key, api_key_id, status, revision, startup_path, memory_mib,
-              vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+              id, host_id, owner_key, api_key_id, status, revision, startup_path, restart_policy,
+              memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid, created_at,
+              updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
              ON CONFLICT(id) DO UPDATE SET
                owner_key = excluded.owner_key,
                api_key_id = excluded.api_key_id,
                status = excluded.status,
                revision = excluded.revision,
                startup_path = excluded.startup_path,
+               restart_policy = excluded.restart_policy,
                memory_mib = excluded.memory_mib,
                vcpus = excluded.vcpus,
                kernel_path = excluded.kernel_path,
@@ -273,6 +281,7 @@ impl Store {
                 vm.status.as_str(),
                 u64_to_sql_i64(vm.revision)?,
                 vm.startup_path.map(VmStartupPath::as_str),
+                vm.restart_policy.as_str(),
                 vm.memory_mib,
                 vm.vcpus,
                 vm.kernel_path,
@@ -308,8 +317,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                        memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid,
-                        created_at, updated_at
+                        restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
+                        socket_path, pid, created_at, updated_at
                  FROM vms WHERE id = ?1",
                 params![id.to_string()],
                 row_to_vm,
@@ -484,8 +493,8 @@ impl Store {
     pub fn list_vms(&self) -> Result<Vec<VmRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                    memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid,
-                    created_at, updated_at
+                    restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
+                    socket_path, pid, created_at, updated_at
              FROM vms ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
@@ -1008,8 +1017,9 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
     let revision = u64::try_from(revision_i64)
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, revision_i64))?;
     let startup_path: Option<String> = row.get(6)?;
-    let created_at: String = row.get(14)?;
-    let updated_at: String = row.get(15)?;
+    let restart_policy: String = row.get(7)?;
+    let created_at: String = row.get(15)?;
+    let updated_at: String = row.get(16)?;
     Ok(VmRecord {
         id: parse_uuid_col(&id, 0)?,
         host_id: row.get(1)?,
@@ -1018,13 +1028,14 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
         status: VmStatus::parse(&status).unwrap_or(VmStatus::Error),
         revision,
         startup_path: startup_path.as_deref().and_then(VmStartupPath::parse),
-        memory_mib: row.get(7)?,
-        vcpus: row.get(8)?,
-        kernel_path: row.get(9)?,
-        rootfs_path: row.get(10)?,
-        cmdline: row.get(11)?,
-        socket_path: row.get(12)?,
-        pid: row.get(13)?,
+        restart_policy: RestartPolicy::parse(&restart_policy).unwrap_or_default(),
+        memory_mib: row.get(8)?,
+        vcpus: row.get(9)?,
+        kernel_path: row.get(10)?,
+        rootfs_path: row.get(11)?,
+        cmdline: row.get(12)?,
+        socket_path: row.get(13)?,
+        pid: row.get(14)?,
         created_at: parse_ts(&created_at)?,
         updated_at: parse_ts(&updated_at)?,
     })
@@ -1685,6 +1696,7 @@ mod tests {
             status: VmStatus::Running,
             revision: 1,
             startup_path: Some(VmStartupPath::Cold),
+            restart_policy: RestartPolicy::No,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "vmlinux".into(),

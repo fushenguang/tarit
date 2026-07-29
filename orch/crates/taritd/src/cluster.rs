@@ -119,14 +119,15 @@ pub async fn resolve_owner(state: &AppState, id: Uuid) -> Result<Owner, OrchErro
     if state.supervisor.is_running(id) {
         return Ok(Owner::Local);
     }
+    // `Stopped` is a durable, retained record now (vm-stop-delete-split) -
+    // resumable via `start`, still readable via `get`/`list` - not a
+    // transient husk to exclude from ownership resolution. Excluding it here
+    // would 404 every stopped VM's GET/status/start, since resolve_owner is
+    // the first thing every one of those handlers calls.
     let exists = state
         .vm_cache
         .read()
-        .map(|cache| {
-            cache
-                .get(&id)
-                .is_some_and(|vm| vm.status != tarit_types::VmStatus::Stopped)
-        })
+        .map(|cache| cache.get(&id).is_some())
         .unwrap_or(false);
     if exists {
         Ok(Owner::Local)

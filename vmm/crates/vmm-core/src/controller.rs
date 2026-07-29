@@ -244,14 +244,29 @@ impl OwnedOverlayGuard {
             .filter_map(|volume| volume.overlay.as_deref())
             .map(PathBuf::from)
         {
-            match OwnedScratchFile::create_new(&path) {
+            // Adopt an existing overlay left behind by a prior VM instance
+            // (the vm-stop-delete-split "start a stopped VM"/restart_policy
+            // path cold-boots against exactly this) before falling back to
+            // creating a fresh one - mirrors prepare_restore_overlay's own
+            // adopt-then-create ordering for the restore path. The actual
+            // CoW header validation happens later, when the block backend
+            // opens this same path (open_private_overlay/CowOverlay::open);
+            // this only decides ownership tracking for later auto-cleanup.
+            let opened = match OwnedScratchFile::adopt_private(&path) {
+                Ok(file) => Ok(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    OwnedScratchFile::create_new(&path)
+                }
+                Err(error) => Err(error),
+            };
+            match opened {
                 Ok(file) => files.push(file),
                 Err(error) => {
                     for file in files.drain(..) {
                         remove_owned_scratch_file(&file);
                     }
                     return Err(VmmError::Snapshot(format!(
-                        "create private overlay {}: {error}",
+                        "open private overlay {}: {error}",
                         path.display()
                     )));
                 }

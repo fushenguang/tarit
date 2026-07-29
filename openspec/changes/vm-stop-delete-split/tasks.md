@@ -1,27 +1,30 @@
 ## 1. Baseline: pin the current bug with failing tests
 
-- [ ] 1.1 Write a failing integration test (`orch`) that boots a VM, calls the current `DELETE` endpoint, and asserts the overlay file is deleted today - this becomes the permanent regression test for "DELETE without force must NOT delete the disk" once its assertion is flipped in section 3.
-- [ ] 1.2 Write a failing test (`orch`) for `readopt_one`'s net-recovery / scheduler-recovery / lock-poison failure branches asserting the overlay currently gets deleted in each of those paths too.
+- [x] 1.1 Write a failing test (`orch`) asserting `stop_vm` retains the overlay disk (today it doesn't) - `stop_vm_retains_overlay_disk`, models the shared `teardown_vm` chokepoint every stop caller routes through.
+- [x] 1.2 Write a failing test (`orch`) for the `readopt_one`/quarantine failure path asserting the overlay currently gets deleted there too - `quarantine_readopted_runtime_retains_overlay_disk`.
 
 ## 2. Store & types foundation (`tarit-store`, `tarit-types`)
 
-- [ ] 2.1 Add `restart_policy` column to the `vms` table via `ensure_column` (`TEXT NOT NULL DEFAULT 'no'`).
-- [ ] 2.2 Add `RestartPolicy` enum (`No` / `Always`) to `tarit-types`; add `VmRecord.restart_policy` and `CreateVmRequest.restart_policy` (defaulted to `No`, same `#[serde(default = ...)]` pattern as `memory_mib`/`vcpus`).
-- [ ] 2.3 Wire `restart_policy` through store row (de)serialization (`row_to_vm_record` and insert/upsert paths).
-- [ ] 2.4 Update `VmStatus::Stopped`'s doc comment to the new "disk retained" meaning; grep for and fix any existing comments/tests that assume the old "Stopped == disk already deleted" meaning.
+- [x] 2.1 Add `restart_policy` column to the `vms` table via `ensure_column` (`TEXT NOT NULL DEFAULT 'no'`) - sqlite (`tarit-store`) and Postgres (`tarit-fleet`, `ALTER ... ADD COLUMN IF NOT EXISTS`) both done.
+- [x] 2.2 Add `RestartPolicy` enum (`No` / `Always`) to `tarit-types`; add `VmRecord.restart_policy`, `CreateVmRequest.restart_policy`, `PublicVmRecord.restart_policy` (defaulted to `No`).
+- [x] 2.3 Wire `restart_policy` through store row (de)serialization in both `tarit-store::row_to_vm` and `tarit-fleet::row_to_vm`.
+- [x] 2.4 Update `VmStatus::Stopped`'s doc comment to the new "disk retained" meaning.
 
 ## 3. `supervisor.rs`: split `stop_vm` / `purge_vm`
 
-- [ ] 3.1 Rename current `teardown_vm` body into `purge_vm` (behavior unchanged); introduce a new `stop_vm` that does everything `purge_vm` does except the overlay unlink and `store.delete_vm` call.
-- [ ] 3.2 Repoint all six existing `teardown_vm` call sites - the HTTP-delete path, `shutdown_sweep`/`stop_all`, the three `readopt_one` failure branches, and `quarantine_readopted_runtime` - at the new non-destructive `stop_vm`.
-- [ ] 3.3 Re-run tasks 1.1/1.2's tests; confirm they now fail in the opposite direction (overlay unexpectedly retained under the old assertion); flip their assertions to the new expected behavior and confirm green.
+- [x] 3.1 Strip the overlay-unlink out of `teardown_vm` (now the shared non-destructive core every existing caller uses unchanged); move it into a new `purge_vm_overlay`, reachable only via a new public `purge_vm` (`stop_vm` + `purge_vm_overlay`).
+- [x] 3.2 All existing `teardown_vm` call sites (stop_vm dispatch, unexpected-exit cleanup, boot-failure cleanup, the three `readopt_one` failure branches, `quarantine_readopted_runtime`, `stop_all`'s shutdown-sweep loop) needed no changes - deletion is opt-in now, not opt-out.
+- [x] 3.3 Tasks 1.1/1.2's tests now pass; updated two tests whose failure-injection relied on the old overlay-deletion behavior (`purge_vm_overlay_preserves_a_remembered_golden_overlay`, `restart_reconciliation_propagates_quarantine_cleanup_failure`).
 
-## 4. `vmm-core`: cold boot from an existing overlay
+## 4. Cold boot from an existing overlay
 
-- [ ] 4.1 Write a failing test in `vmm-core` asserting `create()` today rejects an existing overlay path (`O_CREAT|O_EXCL` failure) - pins the current gap before adding the new mode.
-- [ ] 4.2 Add `overlay_mode: CreateNew | Adopt` to the per-volume create config; wire `Adopt` to reuse `OwnedScratchFile::adopt_private` (the same primitive `prepare_restore_overlay` already uses for `restore()`).
-- [ ] 4.3 Reuse `reject_golden_overlay_target`'s check so `Adopt` mode refuses a path currently registered as a golden artifact.
-- [ ] 4.4 Add tests: adopting a valid existing overlay succeeds and boots correctly; adopting a missing path fails clearly (no silent fallback to `CreateNew`); adopting a golden-registered path is rejected.
+Scope revised after a live-KVM round-trip test (boot → write marker → stop → fresh `vmm serve` process → read marker back) found the real gap was two different, previously-hidden bugs - see design.md Decision 3 for the full account.
+
+- [x] 4.1 Live-KVM round-trip test written first (per TDD), run against the unmodified code: failed twice, for two independent reasons, before any fix landed.
+- [x] 4.2 Fix 1: `create_live` (the real RPC dispatch target for "create") tracks a fresh overlay as an owned scratch file and deletes it on stop - `boot_vm` now releases it via the existing `ReleaseScratch` RPC right after `create()` succeeds, same mechanism the golden-snapshot path already used for its own overlay.
+- [x] 4.3 Fix 2: `OwnedOverlayGuard::create` hard-required `O_CREAT|O_EXCL` - now tries `OwnedScratchFile::adopt_private` first, falling back to `create_new` only when the path doesn't exist.
+- [x] 4.4 Golden-overlay rejection for the reused-overlay path deferred to task group 5's `start` endpoint (needs taritd's `golden_artifacts` registry, which vmm-core has no visibility into - see design.md).
+- [x] 4.5 (added) `released_overlay_survives_stop_and_is_reusable_by_a_fresh_vmm_process` (real KVM, `orch/crates/taritd/src/supervisor.rs`) and `vmm/ci/overlay-reuse-gate.sh` (standalone manual reproduction) both pass end to end.
 
 ## 5. `taritd` API: stop / start / delete?force
 
