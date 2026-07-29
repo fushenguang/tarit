@@ -3462,6 +3462,28 @@ mod tests {
         );
     }
 
+    // Regression test for a real bug this change's live verification found:
+    // cluster::resolve_owner's single-host fallback used to exclude Stopped
+    // VMs from its "does this exist locally" check, which 404'd every
+    // GET/status/start call against a stopped VM (resolve_owner is the first
+    // thing each of those handlers calls) even though the record was very
+    // much still in the cache. Stopped is a durable, resumable state now,
+    // not a transient husk - it must resolve as Owner::Local like any other
+    // status.
+    #[test]
+    fn resolve_owner_finds_a_stopped_vm_locally() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        let record = stopped_test_record(&state, id);
+        state.vm_cache.write().unwrap().insert(id, record);
+
+        let owner = test_runtime()
+            .block_on(cluster::resolve_owner(&state, id))
+            .unwrap();
+
+        assert!(matches!(owner, cluster::Owner::Local));
+    }
+
     // vm-restart capability: starting requires the overlay disk to still be
     // on disk - a Stopped VM with a rootfs but no retained overlay (e.g.
     // after a prior force-delete raced with a stale cache entry) must fail
