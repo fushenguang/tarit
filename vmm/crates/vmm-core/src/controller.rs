@@ -867,14 +867,24 @@ impl VmmController {
                     "SMP live snapshot (vcpus.count > 1) not yet supported".into(),
                 ));
             }
-            let running = vm
-                .running
-                .take()
-                .ok_or_else(|| VmmError::InvalidConfig("VM not running".into()))?;
             let mem = vm
                 .guest_mem
                 .clone()
                 .ok_or_else(|| VmmError::Memory("no guest memory".into()))?;
+            // See the matching check in `suspend_vm_in_place()`/`snapshot()`:
+            // the live-snapshot executor below copies memory via `as_ptr()`,
+            // which only covers a split guest-memory's first region. Checked
+            // before `running.take()` below so a rejection here leaves the VM
+            // untouched instead of tearing down its vCPU threads.
+            if mem.is_split() {
+                return Err(VmmError::Memory(
+                    "live snapshot of a VM with memory split across the device MMIO window is not yet supported".into(),
+                ));
+            }
+            let running = vm
+                .running
+                .take()
+                .ok_or_else(|| VmmError::InvalidConfig("VM not running".into()))?;
             let state_blob = vm.state_blob.clone().unwrap_or_default();
             (running, mem, state_blob)
         };
