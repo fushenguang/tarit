@@ -6,6 +6,7 @@
 //! logic (DRY). Placement/routing decisions live in `cluster`; the public
 //! handlers combine the two.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -1488,6 +1489,209 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
     start_terminal_transition(state, id, VmStatus::Stopped, true)?;
     finish_terminal_transition(state, id).await
+}
+
+/// Stop a VM (if running) and permanently delete its private overlay disk
+/// and store record. The only path that actually destroys data - reached
+/// exclusively via `DELETE /v1/vms/{id}?force=true`. vm-delete capability.
+pub async fn purge_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    let sup = Arc::clone(&state.supervisor);
+    let worker_converged = tokio::task::spawn_blocking(move || sup.cancel_and_wait_owned_task(id))
+        .await
+        .map_err(|error| OrchError::Internal(format!("cancelled lifecycle wait join: {error}")))??;
+    if !worker_converged {
+        let operation_gate = match state.supervisor.operation_gate(id) {
+            Ok(gate) => Some(gate),
+            Err(OrchError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let _operation = match operation_gate {
+            Some(gate) => Some(gate.lock_owned().await),
+            None => None,
+        };
+        let _terminal_gate = state.terminal_transition_gate.lock().await;
+        match lifecycle_state(state, id)? {
+            Some(LifecycleState::Terminal { .. }) => finish_terminal_transition(state, id).await?,
+            Some(LifecycleState::Publishing { .. }) => finish_publication(state, id).await?,
+            Some(
+                LifecycleState::Creating { .. }
+                | LifecycleState::Running { .. }
+                | LifecycleState::Reconciling { .. }
+                | LifecycleState::Abandoned { .. },
+            )
+            | None => {}
+        }
+        // Unlike `stop_local`, there is no "already Stopped, nothing to do"
+        // early return here: an already-Stopped VM still has a disk that
+        // force=true must actually purge.
+        crate::usage::meter_vm_final(state, id);
+        let sup = Arc::clone(&state.supervisor);
+        tokio::task::spawn_blocking(move || sup.purge_vm(id))
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+        start_terminal_transition(state, id, VmStatus::Stopped, true)?;
+        finish_terminal_transition(state, id).await?;
+    }
+    // The record is now durably `Stopped` with its disk already purged.
+    // Remove it entirely rather than leaving a permanently unstartable
+    // ghost row around - vm-restart's "start requires a retained disk"
+    // rule would reject it anyway, so keeping the row adds nothing but
+    // confusion.
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .delete_vm(id)
+        .map_err(crate::api::store_err)?;
+    state
+        .vm_cache
+        .write()
+        .map_err(|_| OrchError::Internal("vm cache".into()))?
+        .remove(&id);
+    Ok(())
+}
+
+/// Cold-start a `Stopped` VM whose overlay disk was retained, reusing that
+/// overlay as its writable layer - a fresh boot, not a restore (no RAM/
+/// register state replay). vm-restart capability, shared by the manual
+/// `POST /v1/vms/{id}/start` endpoint and the startup auto-restart sweep.
+pub async fn start_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
+    let state = state.clone();
+    let worker_state = state.clone();
+    run_supervised_lifecycle(&state, id, move |task| async move {
+        start_local_owned(&worker_state, id, &task).await
+    })
+    .await
+}
+
+async fn start_local_owned(
+    state: &AppState,
+    id: Uuid,
+    task: &OwnedTaskControl,
+) -> Result<VmRecord, OrchError> {
+    let existing = get_local(state, id)?;
+    if existing.status != VmStatus::Stopped {
+        return Err(OrchError::Conflict(format!(
+            "vm {id} is not stopped (status: {:?})",
+            existing.status
+        )));
+    }
+    state
+        .supervisor
+        .ensure_overlay_startable(id, existing.rootfs_path.is_some())?;
+
+    let spawn_cfg = VmSpawnConfig {
+        memory_mib: existing.memory_mib,
+        vcpus: existing.vcpus,
+        kernel_path: PathBuf::from(&existing.kernel_path),
+        rootfs_path: existing.rootfs_path.clone().map(PathBuf::from),
+        cmdline: existing.cmdline.clone(),
+        read_only: state.config.rootfs_read_only,
+        restart_policy: existing.restart_policy,
+    };
+    // Preserve host_id/created_at (same incarnation, just resuming its
+    // lifecycle) and bump revision - register_creating_record's upsert is
+    // fenced on exactly this pair, same as any other lifecycle transition.
+    let mut registration_record = existing.clone();
+    registration_record.status = VmStatus::Creating;
+    registration_record.startup_path = Some(VmStartupPath::Cold);
+    registration_record.revision = existing
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| OrchError::Internal(format!("VM {id} revision exhausted")))?;
+    registration_record.updated_at = Utc::now();
+
+    let creating_state = state.clone();
+    let creating_record = registration_record.clone();
+    let ticket = state
+        .supervisor
+        .begin_boot_with_registration(
+            id,
+            SpawnPurpose::Live,
+            spawn_cfg.resource_shape(),
+            move || async move { register_creating_record(&creating_state, creating_record).await },
+        )
+        .await;
+    let ticket = match ticket {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+    };
+    if task.is_cancelled() {
+        return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
+            .await;
+    }
+
+    let sup = Arc::clone(&state.supervisor);
+    let cfg = spawn_cfg.clone();
+    let booted = tokio::task::spawn_blocking(move || sup.spawn_vm(ticket, cfg)).await;
+    let booted = match booted {
+        Err(error) => {
+            let error = state
+                .supervisor
+                .cleanup_boot_join_failure(id, "start boot task", error);
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
+            if state.supervisor.has_retained_boot(id) {
+                return Err(error);
+            }
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+        Ok(Ok(booted)) => booted,
+        Ok(Err(error)) => {
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
+            if state.supervisor.has_retained_boot(id) {
+                return Err(error);
+            }
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+    };
+    if task.is_cancelled() {
+        let cause = state.supervisor.discard_booted_vm(booted);
+        return finish_cancelled_lifecycle(state, id, task, cause).await;
+    }
+    let publication_state = state.clone();
+    let publication_record = registration_record.clone();
+    let record = match state
+        .supervisor
+        .publish_running_with(booted, move |pid, socket_path| {
+            let mut record = publication_record;
+            record.status = VmStatus::Running;
+            record.pid = Some(pid);
+            record.socket_path = Some(socket_path.display().to_string());
+            record.updated_at = Utc::now();
+            async move {
+                publish_running_record(&publication_state, record.clone()).await?;
+                Ok(record)
+            }
+        })
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            if is_shutdown_rejection(&error) {
+                rollback_shutdown_rejected_lifecycle(state, id, Some(task), error).await?;
+                unreachable!("shutdown lifecycle rollback always returns an error")
+            }
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
+            return Err(error);
+        }
+    };
+    if task.is_cancelled() {
+        return finish_cancelled_lifecycle(state, id, task, lifecycle_cancelled_error()).await;
+    }
+    mark_running(state, record.clone())?;
+    tracing::info!(id = %id, host = %state.config.host_id, "start: cold boot from retained overlay");
+    Ok(record)
 }
 
 /// Detect and persist unexpected VMM exits using one shared bounded scan.
@@ -3178,5 +3382,104 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    fn stopped_test_record(state: &AppState, id: Uuid) -> VmRecord {
+        let now = Utc::now();
+        VmRecord {
+            id,
+            host_id: state.config.host_id.clone(),
+            owner_key: Some("test".into()),
+            api_key_id: None,
+            status: VmStatus::Stopped,
+            revision: 1,
+            startup_path: None,
+            restart_policy: RestartPolicy::No,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "kernel".into(),
+            rootfs_path: None,
+            cmdline: "console=ttyS0".into(),
+            socket_path: None,
+            pid: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // vm-delete capability: force=true is the only path that actually
+    // destroys data - confirms purge_local removes the store row entirely,
+    // not just the disk (which supervisor::tests already covers).
+    #[test]
+    fn purge_local_removes_the_store_row() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        let record = stopped_test_record(&state, id);
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
+
+        test_runtime().block_on(async {
+            // finish_terminal_transition's persist_stopped_record awaits an
+            // ack on this channel before proceeding - nothing drains it by
+            // default (test_state_with_durable_writer hands back the raw
+            // receiver), so every real durable-write path needs this.
+            let writer = tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+            purge_local(&state, id).await.unwrap();
+            writer.abort();
+        });
+
+        assert!(
+            state.store.lock().unwrap().get_vm(id).is_err(),
+            "purge_local must remove the store row, not just the disk"
+        );
+        assert!(
+            state.vm_cache.read().unwrap().get(&id).is_none(),
+            "purge_local must evict the cache entry"
+        );
+    }
+
+    // vm-restart capability: start only makes sense against a Stopped VM.
+    #[test]
+    fn start_local_rejects_a_vm_that_is_not_stopped() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        let mut record = stopped_test_record(&state, id);
+        record.status = VmStatus::Running;
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
+
+        let error = test_runtime().block_on(start_local(&state, id)).unwrap_err();
+
+        assert!(
+            matches!(error, OrchError::Conflict(_)),
+            "starting a non-Stopped VM must be rejected as a conflict: {error}"
+        );
+    }
+
+    // vm-restart capability: starting requires the overlay disk to still be
+    // on disk - a Stopped VM with a rootfs but no retained overlay (e.g.
+    // after a prior force-delete raced with a stale cache entry) must fail
+    // clearly rather than silently cold-booting a brand-new empty disk.
+    #[test]
+    fn start_local_rejects_a_missing_overlay() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        let mut record = stopped_test_record(&state, id);
+        record.rootfs_path = Some("rootfs".into());
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
+
+        let error = test_runtime().block_on(start_local(&state, id)).unwrap_err();
+
+        assert!(
+            matches!(error, OrchError::NotFound(_)),
+            "starting with no retained overlay must be rejected as not-found: {error}"
+        );
     }
 }

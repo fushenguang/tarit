@@ -1161,6 +1161,32 @@ impl VmmSupervisor {
         cfg.rootfs_path.is_some().then(|| self.overlay_path_for(id))
     }
 
+    /// Verify a `Stopped` VM can actually be cold-started via `spawn_vm`
+    /// reusing its existing overlay (the vm-restart capability's `start`):
+    /// the overlay file must still be on disk, and must not be a
+    /// golden-registry-owned artifact (starting directly over a shared
+    /// golden image's overlay would corrupt every warm clone seeded from
+    /// it). vmm-core's own `create()` has no visibility into taritd's
+    /// golden-artifacts registry, so this check belongs here, not there -
+    /// see design.md's Decision 3.
+    pub(crate) fn ensure_overlay_startable(&self, id: Uuid, has_rootfs: bool) -> Result<(), OrchError> {
+        if !has_rootfs {
+            return Ok(());
+        }
+        let path = self.overlay_path_for(id);
+        if !Path::new(&path).exists() {
+            return Err(OrchError::NotFound(format!(
+                "vm {id} has no retained overlay disk to start from"
+            )));
+        }
+        if self.owns_golden_artifact(Path::new(&path))? {
+            return Err(OrchError::Conflict(format!(
+                "vm {id}'s overlay is a golden artifact shared by the warm pool; refusing to start directly over it"
+            )));
+        }
+        Ok(())
+    }
+
     fn snapshot_overlay_path(&self) -> PathBuf {
         self.config
             .socket_dir

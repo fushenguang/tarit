@@ -500,6 +500,8 @@ pub fn router(state: AppState) -> Router {
             "/v1/vms/{id}/pty/sessions/{pty_id}/resize",
             post(crate::pty::resize_session),
         )
+        .route("/v1/vms/{id}/stop", post(stop_vm))
+        .route("/v1/vms/{id}/start", post(start_vm))
         .route("/v1/vms/{id}/pause", post(pause_vm))
         .route("/v1/vms/{id}/suspend", post(suspend_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
@@ -1598,7 +1600,61 @@ async fn vm_status(
     Ok(Json(public_vm_runtime_status(status)?))
 }
 
+#[derive(serde::Deserialize, Default)]
+struct DeleteVmQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+/// Without `?force=true`, DELETE is equivalent to `POST .../stop`: the VM's
+/// process (if any) is stopped but its overlay disk and record are
+/// retained. Only `?force=true` actually purges - vm-delete capability.
+/// Deleting a VM's data must always be an explicit, deliberate choice, never
+/// an accidental default.
 async fn delete_vm(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<DeleteVmQuery>,
+) -> Result<StatusCode, ApiError> {
+    match cluster::resolve_owner(&state, id).await? {
+        Owner::Local => {
+            let vm = ops::get_local(&state, id)?;
+            ensure_vm_access(&identity, &vm)?;
+            if q.force {
+                ops::purge_local(&state, id).await?
+            } else {
+                ops::stop_local(&state, id).await?
+            }
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            if q.force {
+                tokio::task::spawn_blocking(move || peer.purge_remote(&rpc, id, &identity))
+                    .await
+                    .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+            } else {
+                tokio::task::spawn_blocking(move || peer.stop_remote(&rpc, id, &identity))
+                    .await
+                    .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+            }
+        }
+    }
+    audit::record(
+        &state,
+        &identity,
+        audit_action::DELETE,
+        Some(id),
+        audit_outcome::OK,
+        None,
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stop a VM's guest process, retaining its overlay disk and record so it
+/// can later be started again via `POST .../start`. vm-stop capability.
+async fn stop_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
@@ -1620,12 +1676,44 @@ async fn delete_vm(
     audit::record(
         &state,
         &identity,
-        audit_action::DELETE,
+        audit_action::STOP,
         Some(id),
         audit_outcome::OK,
         None,
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Cold-start a `Stopped` VM, reusing its retained overlay disk as its
+/// writable layer. vm-restart capability.
+async fn start_vm(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PublicVmRecord>, ApiError> {
+    let vm = match cluster::resolve_owner(&state, id).await? {
+        Owner::Local => {
+            let vm = ops::get_local(&state, id)?;
+            ensure_vm_access(&identity, &vm)?;
+            ops::start_local(&state, id).await?
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.start_remote(&rpc, id, &identity))
+                .await
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??
+        }
+    };
+    audit::record(
+        &state,
+        &identity,
+        audit_action::START,
+        Some(id),
+        audit_outcome::OK,
+        None,
+    );
+    Ok(Json(PublicVmRecord::from(vm)))
 }
 
 async fn pause_vm(

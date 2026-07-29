@@ -455,6 +455,8 @@ pub struct AuditEvent {
 pub mod audit_action {
     pub const CREATE: &str = "create";
     pub const DELETE: &str = "delete";
+    pub const STOP: &str = "stop";
+    pub const START: &str = "start";
     pub const PAUSE: &str = "pause";
     pub const SUSPEND: &str = "suspend";
     pub const RESUME: &str = "resume";
