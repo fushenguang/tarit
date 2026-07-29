@@ -10,8 +10,24 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- `POST /v1/vms/{id}/stop`: stop a VM's guest process while retaining its
+  private overlay disk and record, so it can be started again later.
+- `POST /v1/vms/{id}/start`: cold-start a `stopped` VM, reusing its retained
+  overlay disk as its writable layer (no RAM/register state replay).
+- `restart_policy` (`no` | `always`) on `POST /v1/vms` and `VmRecord`: an
+  `always`-policy VM still `stopped` when taritd itself restarts is
+  automatically cold-started, Docker-`--restart=always`-style.
+
 ### Changed
 
+- **BREAKING**: `DELETE /v1/vms/{id}` no longer deletes the VM's overlay
+  disk by default. Without `?force=true` it now behaves exactly like the new
+  `POST .../stop` (disk and record retained); only `?force=true` actually
+  purges the disk and removes the record. Deleting data now always requires
+  this explicit, deliberate intent - previously it happened on every
+  `DELETE` unconditionally.
 - SSH gateway client authentication no longer accepts RSA public keys.
 - Guest setup now downloads a reproducibly built Linux 6.12 LTS `vmlinux`,
   verifies its pinned SHA-256, and falls back to a checksum-pinned source build.

@@ -40,9 +40,10 @@ admin keys can call admin-only routes such as `/v1/cluster`.
 ```json
 {
   "id": "uuid",
-  "status": "creating|running|paused|suspended|error",
+  "status": "creating|running|paused|suspended|stopped|error",
   "revision": 3,
   "startup_path": "cold|warm|snapshot_restore",
+  "restart_policy": "no|always",
   "memory_mib": 256,
   "vcpus": 1,
   "created_at": "2026-07-02T00:00:00Z",
@@ -53,7 +54,16 @@ admin keys can call admin-only routes such as `/v1/cluster`.
 This public representation deliberately omits the physical host id, tenant
 ownership metadata, kernel/rootfs/socket paths, kernel command line, and VMM
 process id. Those fields exist only in node persistence and authenticated peer
-RPC. Successfully deleted records are not returned by list or get.
+RPC. Only a force-deleted VM (see `DELETE .../vms/{id}?force=true`) is actually
+removed; a plain `stopped` record - like any other status - is still returned
+by list or get.
+
+`status: "stopped"` means the guest process is not running but the VM's
+private overlay disk **and** this record are retained and can be resumed via
+`POST /v1/vms/{id}/start` - it does not mean the VM's data has been deleted.
+`restart_policy: "always"` cold-starts the VM automatically (reusing its
+retained overlay) the next time taritd itself restarts and finds the VM still
+`stopped`; `no` (the default) leaves it stopped until a manual `start`.
 
 ### `LiveVmStatus`
 
@@ -248,7 +258,8 @@ Request:
   "kernel_path": "optional admin-only kernel override",
   "image": "optional registered image name[:tag]",
   "rootfs_path": "optional admin-only rootfs override, empty string means no rootfs",
-  "cmdline": "optional kernel command line override"
+  "cmdline": "optional kernel command line override",
+  "restart_policy": "optional no|always, default no"
 }
 ```
 
@@ -263,6 +274,7 @@ Defaults from `tarit-types` and `Config`:
 | `image` | unset; when present it resolves through the node-local image registry and cannot be combined with `rootfs_path` |
 | `rootfs_path` | `TARIT_ROOTFS`; admin-only override; empty string disables rootfs |
 | `cmdline` | default virtio block kernel cmdline when rootfs exists, otherwise `console=ttyS0 panic=1` |
+| `restart_policy` | `no`; `always` cold-starts the VM automatically on the next taritd startup if it's still `stopped` then (`on-failure`/`unless-stopped`-style policies are not supported - no health-check infrastructure exists) |
 
 Response `201`: `VmRecord`.
 
@@ -396,13 +408,53 @@ Status codes: `200`, `201`, `204`, `400`, `401`, `404`, `409`, `429`, `500`. A b
 
 ### `DELETE /v1/vms/{id}`
 
-Resolve owner, stop the VM on its owner, mark the owner's local record as `stopped`, release the local scheduler slot, and remove the VM ownership row from `fleet_vms`.
+**Without `?force=true` this is non-destructive** - exactly equivalent to
+`POST /v1/vms/{id}/stop` below: resolve owner, stop the VM's guest process on
+its owner, mark the record `stopped`, release the local scheduler slot, and
+remove the VM ownership row from `fleet_vms`. The VM's private overlay disk
+and its local SQLite record are both retained - a later `GET` still finds
+the `stopped` record, and `POST /v1/vms/{id}/start` can bring it back.
+
+**With `?force=true`** the VM is additionally purged: its overlay disk is
+deleted and its SQLite record is removed entirely - this is the only way to
+actually destroy a VM's data. **BREAKING** relative to earlier versions of
+this API, which deleted the disk unconditionally on every `DELETE`: deleting
+data now always requires this explicit, deliberate `force=true` intent.
 
 Response `204`: no body.
 
 Status codes: `204`, `401`, `403`, `404`, `500`.
 
-Note: the local SQLite VM row is not deleted. On the owner, a later local `GET` can still find the stopped record. Other nodes generally cannot find it after `fleet_vms` is cleared.
+### `POST /v1/vms/{id}/stop`
+
+Resolve owner and stop the VM's guest process, retaining its overlay disk
+and record so it can be started again later. The public handler does not
+require a JSON body. Idempotent: stopping an already-`stopped` VM is a no-op.
+
+Response `204`: no body.
+
+Status codes: `204`, `401`, `403`, `404`, `500`.
+
+### `POST /v1/vms/{id}/start`
+
+Resolve owner and cold-start a `stopped` VM, reusing its retained overlay
+disk as its writable layer - a fresh boot, not a resume: no RAM or register
+state is replayed (contrast with `POST /v1/restore`, which replays a RAM
+snapshot). The public handler does not require a JSON body.
+
+Response `200`: updated `VmRecord` with `status: "running"`.
+
+Status codes:
+
+| Status | Meaning |
+| --- | --- |
+| `200` | VM started. |
+| `401` | Missing or wrong `X-API-Key`. |
+| `403` | VM belongs to a different tenant. |
+| `404` | VM not found, or its overlay disk is missing (e.g. it was previously force-deleted). |
+| `409` | VM is not currently `stopped`, or its overlay is a golden artifact the warm pool depends on. |
+| `429` | No local or cluster capacity available right now; same admission behavior as `POST /v1/vms`. |
+| `500` | VMM, peer, fleet, or internal failure. |
 
 ### `POST /v1/vms/{id}/pause`
 
@@ -640,7 +692,8 @@ networks.
 | POST | `/internal/v1/restore` | `RestoreRequest` | `201 VmRecord` | Restore on this node only. |
 | GET | `/internal/v1/vms/{id}` | none | `200 VmRecord` | Get from this node's local store. |
 | GET | `/internal/v1/vms/{id}/status` | none | `200 LiveVmStatus` | Query live status from this node's local VMM. |
-| DELETE | `/internal/v1/vms/{id}` | none | `204` | Stop on this node and clear local/fleet ownership. |
+| DELETE | `/internal/v1/vms/{id}` | none | `204` | Stop on this node and clear local/fleet ownership. `?force=true` purges the disk + record entirely instead. |
+| POST | `/internal/v1/vms/{id}/start` | none | `200 VmRecord` | Cold-start a stopped VM on this node, reusing its retained overlay. |
 | POST | `/internal/v1/vms/{id}/exec` | `{"command":"...","timeout_ms":30000}` | `200 {exit_code,stdout,stderr,duration_ms}` | Execute on this node's VM. |
 | POST | `/internal/v1/vms/{id}/pause` | none | `200 VmRecord` | Pause local VM. |
 | POST | `/internal/v1/vms/{id}/resume` | none | `200 VmRecord` | Resume local VM. |
