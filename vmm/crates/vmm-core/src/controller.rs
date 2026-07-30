@@ -2397,6 +2397,11 @@ fn concat_split_guest_memory(mem: &vmm_memory_backend::GuestMemory) -> Vec<u8> {
 /// regions in the same ascending-GPA order it was concatenated in. `mem`
 /// must be freshly allocated and not yet shared (this exclusively owns and
 /// directly writes each region's backing mmap).
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+#[allow(dead_code)]
 fn fill_split_guest_memory(
     mem: &vmm_memory_backend::GuestMemory,
     file: &mut std::fs::File,
