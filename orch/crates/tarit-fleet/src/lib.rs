@@ -177,8 +177,9 @@ impl PostgresFleet {
                     &vm.owner_key,
                     &vm.api_key_id,
                     &vm.status.as_str(),
-                    &i64::try_from(vm.revision)
-                        .map_err(|_| FleetError::Config("VM revision exceeds PostgreSQL BIGINT".into()))?,
+                    &i64::try_from(vm.revision).map_err(|_| {
+                        FleetError::Config("VM revision exceeds PostgreSQL BIGINT".into())
+                    })?,
                     &vm.startup_path.map(VmStartupPath::as_str),
                     &vm.restart_policy.as_str(),
                     &(vm.memory_mib as i64),
@@ -946,6 +947,11 @@ fn row_to_vm(row: &tokio_postgres::Row) -> Result<VmRecord, FleetError> {
         revision,
         startup_path: startup_path.as_deref().and_then(VmStartupPath::parse),
         restart_policy: RestartPolicy::parse(&restart_policy).unwrap_or_default(),
+        // The cross-host fleet index does not mirror egress configuration;
+        // it is host-local state reapplied by the owning taritd on cold
+        // start (see tarit-store::update_vm_egress), not cluster-synced.
+        egress_allowlist: None,
+        egress_allow_existing: false,
         memory_mib,
         vcpus,
         kernel_path: row.get(10),
@@ -1159,6 +1165,8 @@ mod tests {
             revision: 1,
             startup_path: None,
             restart_policy: RestartPolicy::No,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "/opt/tarit/vmlinux".into(),

@@ -230,11 +230,13 @@ impl Store {
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
         ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "vms", "startup_path", "TEXT")?;
+        ensure_column(&conn, "vms", "restart_policy", "TEXT NOT NULL DEFAULT 'no'")?;
+        ensure_column(&conn, "vms", "egress_allowlist", "TEXT")?;
         ensure_column(
             &conn,
             "vms",
-            "restart_policy",
-            "TEXT NOT NULL DEFAULT 'no'",
+            "egress_allow_existing",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "snapshots", "memory_mib", "INTEGER")?;
         ensure_column(&conn, "snapshots", "overlay_path", "TEXT")?;
@@ -250,12 +252,14 @@ impl Store {
     }
 
     pub fn insert_vm(&self, vm: &VmRecord) -> Result<(), StoreError> {
+        let egress_allowlist_json = encode_egress_allowlist(vm.egress_allowlist.as_deref());
         let changed = self.conn.execute(
             "INSERT INTO vms (
               id, host_id, owner_key, api_key_id, status, revision, startup_path, restart_policy,
+              egress_allowlist, egress_allow_existing,
               memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid, created_at,
               updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
              ON CONFLICT(id) DO UPDATE SET
                owner_key = excluded.owner_key,
                api_key_id = excluded.api_key_id,
@@ -283,6 +287,8 @@ impl Store {
                 u64_to_sql_i64(vm.revision)?,
                 vm.startup_path.map(VmStartupPath::as_str),
                 vm.restart_policy.as_str(),
+                egress_allowlist_json,
+                vm.egress_allow_existing,
                 vm.memory_mib,
                 vm.vcpus,
                 vm.kernel_path,
@@ -319,7 +325,8 @@ impl Store {
             .query_row(
                 "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
                         restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
-                        socket_path, pid, created_at, updated_at
+                        socket_path, pid, created_at, updated_at, egress_allowlist,
+                        egress_allow_existing
                  FROM vms WHERE id = ?1",
                 params![id.to_string()],
                 row_to_vm,
@@ -378,7 +385,8 @@ impl Store {
              FROM snapshots WHERE vm_id = ?1",
         )?;
         let rows = stmt.query_map(params![vm_id.to_string()], row_to_snapshot)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Deletes every snapshot ownership record for a VM. The caller is
@@ -519,7 +527,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
                     restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
-                    socket_path, pid, created_at, updated_at
+                    socket_path, pid, created_at, updated_at, egress_allowlist,
+                    egress_allow_existing
              FROM vms ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
@@ -657,6 +666,29 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE vms SET status = ?2, revision = revision + 1, updated_at = ?3 WHERE id = ?1",
             params![id.to_string(), status.as_str(), now],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Persist a VM's egress allowlist independent of lifecycle `revision`
+    /// fencing: this is caller-configured metadata, not a lifecycle
+    /// transition, and must be settable regardless of what state a
+    /// concurrent start/stop is in. taritd reapplies it after every cold
+    /// start so the enforced policy on the host does not silently reset to
+    /// the fresh-allocation default deny-all.
+    pub fn update_vm_egress(
+        &self,
+        id: Uuid,
+        allowlist: &[String],
+        allow_existing: bool,
+    ) -> Result<(), StoreError> {
+        let egress_allowlist_json = encode_egress_allowlist(Some(allowlist));
+        let n = self.conn.execute(
+            "UPDATE vms SET egress_allowlist = ?2, egress_allow_existing = ?3 WHERE id = ?1",
+            params![id.to_string(), egress_allowlist_json, allow_existing],
         )?;
         if n == 0 {
             return Err(StoreError::NotFound);
@@ -1059,6 +1091,18 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
     let restart_policy: String = row.get(7)?;
     let created_at: String = row.get(15)?;
     let updated_at: String = row.get(16)?;
+    let egress_allowlist_json: Option<String> = row.get(17)?;
+    let egress_allowlist = egress_allowlist_json
+        .map(|json| {
+            serde_json::from_str::<Vec<String>>(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    17,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })
+        .transpose()?;
     Ok(VmRecord {
         id: parse_uuid_col(&id, 0)?,
         host_id: row.get(1)?,
@@ -1068,6 +1112,8 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
         revision,
         startup_path: startup_path.as_deref().and_then(VmStartupPath::parse),
         restart_policy: RestartPolicy::parse(&restart_policy).unwrap_or_default(),
+        egress_allowlist,
+        egress_allow_existing: row.get(18)?,
         memory_mib: row.get(8)?,
         vcpus: row.get(9)?,
         kernel_path: row.get(10)?,
@@ -1077,6 +1123,12 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
         pid: row.get(14)?,
         created_at: parse_ts(&created_at)?,
         updated_at: parse_ts(&updated_at)?,
+    })
+}
+
+fn encode_egress_allowlist(allowlist: Option<&[String]>) -> Option<String> {
+    allowlist.map(|list| {
+        serde_json::to_string(list).expect("serializing a [String] to JSON cannot fail")
     })
 }
 
@@ -1736,6 +1788,8 @@ mod tests {
             revision: 1,
             startup_path: Some(VmStartupPath::Cold),
             restart_policy: RestartPolicy::No,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "vmlinux".into(),
@@ -1774,5 +1828,22 @@ mod tests {
         stale.status = VmStatus::Paused;
         store.update_vm(&stale).unwrap();
         assert_eq!(store.get_vm(vm.id).unwrap(), updated);
+
+        // egress_allowlist survives independently of the lifecycle
+        // revision-fenced update_vm() path above, so a cold start can read
+        // back whatever a prior PATCH /v1/egress/vm/{id} last set.
+        store
+            .update_vm_egress(vm.id, &["1.2.3.4/32:443/tcp".to_string()], true)
+            .unwrap();
+        let reloaded = store.get_vm(vm.id).unwrap();
+        assert_eq!(
+            reloaded.egress_allowlist,
+            Some(vec!["1.2.3.4/32:443/tcp".to_string()])
+        );
+        assert!(reloaded.egress_allow_existing);
+        assert_eq!(
+            store.list_vms().unwrap()[0].egress_allowlist,
+            Some(vec!["1.2.3.4/32:443/tcp".to_string()])
+        );
     }
 }

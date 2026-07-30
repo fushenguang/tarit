@@ -969,11 +969,7 @@ async fn restart_policy_sweep(state: &AppState) {
             }
         }
     }
-    tracing::info!(
-        started,
-        failed,
-        "restart_policy sweep: complete"
-    );
+    tracing::info!(started, failed, "restart_policy sweep: complete");
 }
 
 /// Pure selection logic for `restart_policy_sweep`, split out so the
@@ -1089,6 +1085,8 @@ mod tests {
             revision: 1,
             startup_path: None,
             restart_policy,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),
@@ -1107,12 +1105,7 @@ mod tests {
         let wrong_status = sweep_test_vm("this-host", VmStatus::Running, RestartPolicy::Always);
         let wrong_policy = sweep_test_vm("this-host", VmStatus::Stopped, RestartPolicy::No);
         let wrong_host = sweep_test_vm("other-host", VmStatus::Stopped, RestartPolicy::Always);
-        let vms = [
-            wanted.clone(),
-            wrong_status,
-            wrong_policy,
-            wrong_host,
-        ];
+        let vms = [wanted.clone(), wrong_status, wrong_policy, wrong_host];
 
         let candidates = restart_policy_candidates(vms.iter(), "this-host");
 

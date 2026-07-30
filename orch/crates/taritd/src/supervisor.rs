@@ -1169,7 +1169,11 @@ impl VmmSupervisor {
     /// it). vmm-core's own `create()` has no visibility into taritd's
     /// golden-artifacts registry, so this check belongs here, not there -
     /// see design.md's Decision 3.
-    pub(crate) fn ensure_overlay_startable(&self, id: Uuid, has_rootfs: bool) -> Result<(), OrchError> {
+    pub(crate) fn ensure_overlay_startable(
+        &self,
+        id: Uuid,
+        has_rootfs: bool,
+    ) -> Result<(), OrchError> {
         if !has_rootfs {
             return Ok(());
         }
@@ -2774,9 +2778,7 @@ impl VmmSupervisor {
             .iter()
             .find(|artifact| artifact.path() == Path::new(&snapshot_path))
             .expect("capture_golden_artifacts always includes the snapshot artifact");
-        if let Err(error) =
-            client.release_scratch(&snapshot_path, snapshot_artifact.identity())
-        {
+        if let Err(error) = client.release_scratch(&snapshot_path, snapshot_artifact.identity()) {
             cleanup_golden_artifacts(artifacts);
             return Err(self.cleanup_boot_failure(
                 id,
@@ -4740,6 +4742,8 @@ mod tests {
             revision: 7,
             startup_path: None,
             restart_policy: tarit_types::RestartPolicy::No,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),
@@ -6505,9 +6509,7 @@ mod tests {
         tarit_vmm_client::wait_for_socket(&socket, Duration::from_secs(5))
             .expect("vmm socket (round 1)");
         let client = VmmClient::new(&socket).with_request_timeout(Duration::from_secs(30));
-        client
-            .create(vmm_config.clone())
-            .expect("create (round 1)");
+        client.create(vmm_config.clone()).expect("create (round 1)");
         let artifact =
             OwnedArtifact::capture(&overlay).expect("open just-created overlay (round 1)");
         client

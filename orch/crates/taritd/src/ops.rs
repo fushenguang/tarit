@@ -849,6 +849,8 @@ fn creating_record(
         revision: 1,
         startup_path: None,
         restart_policy: spawn_cfg.restart_policy,
+        egress_allowlist: None,
+        egress_allow_existing: false,
         memory_mib: spawn_cfg.memory_mib,
         vcpus: spawn_cfg.vcpus,
         kernel_path: spawn_cfg.kernel_path.display().to_string(),
@@ -1317,6 +1319,8 @@ async fn restore_local_owned(
         revision: 1,
         startup_path: Some(VmStartupPath::SnapshotRestore),
         restart_policy: RestartPolicy::No,
+        egress_allowlist: None,
+        egress_allow_existing: false,
         memory_mib,
         vcpus,
         kernel_path,
@@ -1500,7 +1504,9 @@ pub async fn purge_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     let sup = Arc::clone(&state.supervisor);
     let worker_converged = tokio::task::spawn_blocking(move || sup.cancel_and_wait_owned_task(id))
         .await
-        .map_err(|error| OrchError::Internal(format!("cancelled lifecycle wait join: {error}")))??;
+        .map_err(|error| {
+            OrchError::Internal(format!("cancelled lifecycle wait join: {error}"))
+        })??;
     if !worker_converged {
         let operation_gate = match state.supervisor.operation_gate(id) {
             Ok(gate) => Some(gate),
@@ -1726,8 +1732,48 @@ async fn start_local_owned(
         return finish_cancelled_lifecycle(state, id, task, lifecycle_cancelled_error()).await;
     }
     mark_running(state, record.clone())?;
+    reapply_egress_after_cold_start(state, id, &existing).await;
     tracing::info!(id = %id, host = %state.config.host_id, "start: cold boot from retained overlay");
     Ok(record)
+}
+
+/// A cold start provisions a brand-new tap/slot allocation with the
+/// networking layer's fresh-allocation default (deny-all egress) - the
+/// previous allocation, and any allowlist applied to it, was torn down when
+/// the VM was stopped (see net.rs's `SlotAllocator::free`/`allocate`). Reapply
+/// whatever allowlist was last persisted via `PATCH /v1/egress/vm/{id}` so a
+/// VM's egress does not silently regress to deny-all on every restart -
+/// callers (including the `restart_policy` sweep) no longer need to remember
+/// to redo it themselves. Best-effort: the VM is already durably `Running`
+/// with a fully booted guest by the time this runs, so a reapply failure is
+/// logged rather than failing an otherwise-successful start.
+async fn reapply_egress_after_cold_start(state: &AppState, id: Uuid, existing: &VmRecord) {
+    let Some(allowlist) = existing.egress_allowlist.clone() else {
+        return;
+    };
+    let allow_existing = existing.egress_allow_existing;
+    let sup = Arc::clone(&state.supervisor);
+    let result =
+        tokio::task::spawn_blocking(move || sup.update_egress(id, allowlist, allow_existing)).await;
+    match result {
+        Ok(Ok(rules)) => {
+            tracing::info!(id = %id, rules, "start: reapplied persisted egress allowlist after cold start");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                id = %id,
+                %error,
+                "start: failed to reapply persisted egress allowlist after cold start; VM is running with the default deny-all policy until PATCH /v1/egress/vm/{{id}} is retried"
+            );
+        }
+        Err(join_error) => {
+            tracing::error!(
+                id = %id,
+                %join_error,
+                "start: egress reapply task panicked after cold start; VM is running with the default deny-all policy until PATCH /v1/egress/vm/{{id}} is retried"
+            );
+        }
+    }
 }
 
 /// Detect and persist unexpected VMM exits using one shared bounded scan.
@@ -1969,9 +2015,38 @@ pub async fn egress_local(
     let _operation = gate.lock_owned().await;
     ensure_vm_status(state, id, "update egress for", LIVE_CONTROL_STATUSES)?;
     let sup = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || sup.update_egress(id, allowlist, allow_existing))
-        .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+    let applied_allowlist = allowlist.clone();
+    let rules =
+        tokio::task::spawn_blocking(move || sup.update_egress(id, allowlist, allow_existing))
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+    // Persist independently of the tap/slot lifecycle in net.rs, whose
+    // in-memory policy is wiped on every stop and reset to a fresh-allocation
+    // default deny-all on every subsequent start. Without this, the enforced
+    // policy silently regresses to deny-all on the VM's next cold start.
+    persist_egress_allowlist(state, id, &applied_allowlist, allow_existing)?;
+    Ok(rules)
+}
+
+fn persist_egress_allowlist(
+    state: &AppState,
+    id: Uuid,
+    allowlist: &[String],
+    allow_existing: bool,
+) -> Result<(), OrchError> {
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .update_vm_egress(id, allowlist, allow_existing)
+        .map_err(crate::api::store_err)?;
+    if let Ok(mut cache) = state.vm_cache.write() {
+        if let Some(record) = cache.get_mut(&id) {
+            record.egress_allowlist = Some(allowlist.to_vec());
+            record.egress_allow_existing = allow_existing;
+        }
+    }
+    Ok(())
 }
 
 pub fn get_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
@@ -3399,6 +3474,8 @@ mod tests {
                 revision: 1,
                 startup_path: None,
                 restart_policy: RestartPolicy::No,
+                egress_allowlist: None,
+                egress_allow_existing: false,
                 memory_mib: 256,
                 vcpus: 1,
                 kernel_path: "kernel".into(),
@@ -3431,6 +3508,8 @@ mod tests {
             revision: 1,
             startup_path: None,
             restart_policy: RestartPolicy::No,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),
@@ -3568,7 +3647,12 @@ mod tests {
             cmdline: Some("console=ttyS0".into()),
             created_at: now,
         };
-        state.store.lock().unwrap().insert_snapshot(&snapshot).unwrap();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert_snapshot(&snapshot)
+            .unwrap();
 
         test_runtime().block_on(async {
             let writer = tokio::spawn(async move {
@@ -3614,7 +3698,9 @@ mod tests {
         state.store.lock().unwrap().insert_vm(&record).unwrap();
         state.vm_cache.write().unwrap().insert(id, record);
 
-        let error = test_runtime().block_on(start_local(&state, id)).unwrap_err();
+        let error = test_runtime()
+            .block_on(start_local(&state, id))
+            .unwrap_err();
 
         assert!(
             matches!(error, OrchError::Conflict(_)),
@@ -3657,7 +3743,9 @@ mod tests {
         state.store.lock().unwrap().insert_vm(&record).unwrap();
         state.vm_cache.write().unwrap().insert(id, record);
 
-        let error = test_runtime().block_on(start_local(&state, id)).unwrap_err();
+        let error = test_runtime()
+            .block_on(start_local(&state, id))
+            .unwrap_err();
 
         assert!(
             matches!(error, OrchError::NotFound(_)),
