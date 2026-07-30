@@ -1535,6 +1535,29 @@ pub async fn purge_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         start_terminal_transition(state, id, VmStatus::Stopped, true)?;
         finish_terminal_transition(state, id).await?;
     }
+    // Remove every snapshot ever taken of this VM: their RAM/overlay files
+    // are never referenced by the VM's own live overlay and have no other
+    // caller that ever cleans them up, so left in place after a force-delete
+    // they accumulate on disk forever. Must happen before the store rows
+    // are dropped below, since list_snapshots_by_vm needs them.
+    let snapshots = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .list_snapshots_by_vm(id)
+        .map_err(crate::api::store_err)?;
+    if !snapshots.is_empty() {
+        let sup = Arc::clone(&state.supervisor);
+        tokio::task::spawn_blocking(move || sup.purge_vm_snapshots(&snapshots))
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))?;
+    }
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .delete_snapshots_for_vm(id)
+        .map_err(crate::api::store_err)?;
     // The record is now durably `Stopped` with its disk already purged.
     // Remove it entirely rather than leaving a permanently unstartable
     // ghost row around - vm-restart's "start requires a retained disk"
