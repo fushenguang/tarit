@@ -99,19 +99,39 @@ impl VcpuThread {
             tid_for_thread.store(my_tid, Ordering::SeqCst);
 
             // Warm up glibc's allocator BEFORE seccomp closes off openat. On the
-            // first large (mmap-backed) allocation glibc lazily reads
-            // /proc/sys/vm/overcommit_memory; if that first big allocation
-            // happens later in the run loop (e.g. buffering a chatty guest's
-            // serial output), the openat is rejected with SIGSYS and the vCPU
-            // thread is killed mid-boot. Forcing the read here, while syscalls
-            // are unrestricted, makes glibc cache the result so the steady-state
-            // run loop never needs openat.
+            // first allocation serviced by a given code path (brk-backed small
+            // allocations, mmap-backed large ones, and any allocation that
+            // pushes the dynamic mmap threshold past a boundary it hasn't hit
+            // yet) glibc can lazily read /proc/sys/vm/overcommit_memory; if
+            // that first read happens later in the run loop instead (e.g.
+            // buffering a chatty guest's serial output on a from-retained-
+            // overlay boot, which tends to produce more console traffic than a
+            // pristine first boot), the openat is rejected with SIGSYS and the
+            // vCPU thread is killed — confirmed in production via a kernel
+            // audit-log entry (sig=31/SIGSYS, syscall=257/openat) landing a few
+            // seconds into exactly this boot path. A single 8MiB allocation
+            // wasn't enough to reliably pre-trigger every code path glibc might
+            // later need; touch a spread of size classes (well under and well
+            // over glibc's default 128KiB mmap threshold, up to the 32MiB
+            // ceiling glibc's dynamic threshold can grow to) here instead, while
+            // syscalls are still unrestricted, so nothing later in the run loop
+            // is the first to need openat.
             {
-                let mut warm = vec![0; 8 * 1024 * 1024];
-                warm[0] = 1;
-                warm[8 * 1024 * 1024 - 1] = 1;
-                std::hint::black_box(&warm);
-                drop(warm);
+                for size in [
+                    4 * 1024,
+                    64 * 1024,
+                    256 * 1024,
+                    1024 * 1024,
+                    4 * 1024 * 1024,
+                    16 * 1024 * 1024,
+                    32 * 1024 * 1024,
+                ] {
+                    let mut warm = vec![0u8; size];
+                    warm[0] = 1;
+                    warm[size - 1] = 1;
+                    std::hint::black_box(&warm);
+                    drop(warm);
+                }
             }
 
             // Install the seccomp filter for this dedicated vCPU
