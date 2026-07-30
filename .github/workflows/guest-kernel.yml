@@ -69,7 +69,13 @@ jobs:
         run: |
           set -euo pipefail
           . vmm/guest/kernel-version.env
-          test "$KERNEL_RELEASE_REPOSITORY" = "$GITHUB_REPOSITORY"
+          # No repository-identity guard here on purpose: this job only builds
+          # and reproducibility-verifies the kernel from source as a workflow
+          # artifact, it never publishes anything, so it's safe (and useful)
+          # to run on a fork too. The guard that matters lives in the
+          # `release` job below, right before the actual GitHub Release is
+          # created - that's what must never fire under the wrong repository
+          # identity.
           {
             echo "version=$KERNEL_VERSION"
             echo "tag=$KERNEL_RELEASE_TAG"

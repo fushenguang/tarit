@@ -2397,6 +2397,11 @@ fn concat_split_guest_memory(mem: &vmm_memory_backend::GuestMemory) -> Vec<u8> {
 /// regions in the same ascending-GPA order it was concatenated in. `mem`
 /// must be freshly allocated and not yet shared (this exclusively owns and
 /// directly writes each region's backing mmap).
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+#[allow(dead_code)]
 fn fill_split_guest_memory(
     mem: &vmm_memory_backend::GuestMemory,
     file: &mut std::fs::File,
@@ -2414,7 +2419,7 @@ fn fill_split_guest_memory(
         // shared — region.as_ptr()/len() describe a live mmap'd region we
         // exclusively own for the lifetime of this call.
         let region_slice: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(region.as_ptr() as *mut u8, len) };
+            unsafe { std::slice::from_raw_parts_mut(region.as_ptr(), len) };
         file.read_exact(region_slice)?;
     }
     Ok(())
@@ -3153,8 +3158,9 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
             // order `new_with_mmio_hole` always builds them in) into one flat
             // buffer with no per-region metadata — read it back the same way,
             // region by region, off the same file cursor.
-            fill_split_guest_memory(&mem, &mut file)
-                .map_err(|e| VmmError::Snapshot(format!("read mem region in {path_display}: {e}")))?;
+            fill_split_guest_memory(&mem, &mut file).map_err(|e| {
+                VmmError::Snapshot(format!("read mem region in {path_display}: {e}"))
+            })?;
         } else {
             let mem_slice: &mut [u8] = {
                 // SAFETY: `mem` was just allocated with `mem_len` bytes and is owned here.
@@ -4416,7 +4422,8 @@ mod tests {
         // Distinct, position-independent fill per region so a
         // region-boundary bug (off-by-one, swapped order, wrong length)
         // shows up as a content mismatch instead of accidentally passing.
-        src.write_phys(0, &vec![0xAAu8; 8192]).expect("fill region 0");
+        src.write_phys(0, &vec![0xAAu8; 8192])
+            .expect("fill region 0");
         src.write_phys(gap_end, &vec![0xBBu8; 4096])
             .expect("fill region 1");
 

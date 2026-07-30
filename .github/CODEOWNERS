@@ -1,21 +1,25 @@
 # Code owners are automatically requested for review on pull requests.
+#
+# This is an independently maintained fork of instavm/tarit (see README) -
+# ownership below reflects this fork's own maintainer, not upstream's.
+
 # Default owner for everything in the repository.
-*               @abhishek-anand
+*               @fushenguang
 
 # Shared wire protocol crate (tarit-proto). Changes here move both sides.
-/proto/         @abhishek-anand
+/proto/         @fushenguang
 
 # The Tarit VMM (microVM monitor) workspace.
-/vmm/           @abhishek-anand
+/vmm/           @fushenguang
 
 # taritd, the orchestrator and control plane workspace.
-/orch/          @abhishek-anand
+/orch/          @fushenguang
 
 # CI, security workflows, issue templates, and repo automation.
-/.github/       @abhishek-anand
+/.github/       @fushenguang
 
 # Licensing, dependency policy, and release notes.
-/LICENSE        @abhishek-anand
-/NOTICE         @abhishek-anand
-/deny.toml      @abhishek-anand
-/CHANGELOG.md   @abhishek-anand
+/LICENSE        @fushenguang
+/NOTICE         @fushenguang
+/deny.toml      @fushenguang
+/CHANGELOG.md   @fushenguang
