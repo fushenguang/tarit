@@ -209,6 +209,23 @@ TOML and environment variables interact as follows:
 - If `[warm_pool]` omits `class`, the built-in default class remains.
 - A warm-pool class may set `image` or `rootfs`, not both.
 
+## `taritd image build` (offline image-registration CLI)
+
+Separate from the daemon config above (`Config::from_env()`): `taritd image
+build --oci <ref> --name <name:tag> --size-mib <mib>` is a one-off admin
+command (`LocalImageConfig::from_env()`) that unpacks an OCI image into a
+registered ext4 rootfs via `vmm pull --agent <binary> ...`, injecting a guest
+agent binary as init.
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_VMM_BIN` | path | `vmm` (looked up on `PATH`) | Same variable as the daemon's, but here it also seeds the guest-agent search below. |
+| `TARIT_VMM_AGENT` | path | see below | Guest agent binary injected into the built image. If unset, resolved in order: (1) `<TARIT_VMM_BIN>/../../guest/agent/vmm-agent` (a source-tree build sitting next to `vmm`), (2) `<TARIT_VMM_BIN>/../libexec/tarit/vmm-agent` (an installed-prefix layout), (3) `/usr/local/libexec/tarit/vmm-agent`, (4) `/usr/libexec/tarit/vmm-agent` - first one that exists on disk wins. |
+| `TARIT_DB` | path | `~/.taritd/fleet.db` | Same variable as the daemon's. |
+| `TARIT_IMAGES_DIR` | path | `~/.taritd/images` | Same variable as the daemon's. |
+
+**Footgun, hit in production (2026-07-28, see `docs/implementation/07-ai-coding-image.mdx` in the docs site for the full account):** fixing a guest-agent bug means updating it in *three* places, and it is easy to do only two - fork source, and a patched default `rootfs.ext4` if one is already deployed - while missing the third: whichever file this resolution order actually lands on for `image build`'s injection. That file has no relationship to the daemon's own running guest agent and is not rebuilt by `cargo build`; every `image build` silently re-injects whatever stale binary sits at that path until it is manually replaced (with a timestamped backup first, matching this project's standing rollback discipline) or `TARIT_VMM_AGENT` is set explicitly to a known-fresh build.
+
 ## Example environment blocks
 
 ### Single-node dev

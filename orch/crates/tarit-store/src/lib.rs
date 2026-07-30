@@ -222,6 +222,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS audit_outbox_unsent ON audit_outbox(sent);
              CREATE INDEX IF NOT EXISTS shares_owner ON shares(owner_key, created_at DESC);
              CREATE INDEX IF NOT EXISTS shares_vm ON shares(vm_id);
+             CREATE INDEX IF NOT EXISTS snapshots_vm ON snapshots(vm_id);
              CREATE INDEX IF NOT EXISTS vm_quota_reservations_owner_expiry
                ON vm_quota_reservations(owner_key, expires_at);",
         )?;
@@ -365,6 +366,30 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    /// All snapshot ownership records captured for a VM, so a force-delete can
+    /// find (and remove) every RAM/overlay file it left behind, not just the
+    /// VM's own live overlay.
+    pub fn list_snapshots_by_vm(&self, vm_id: Uuid) -> Result<Vec<SnapshotRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+                    kernel_path, rootfs_path, cmdline, created_at
+             FROM snapshots WHERE vm_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![vm_id.to_string()], row_to_snapshot)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+    }
+
+    /// Deletes every snapshot ownership record for a VM. The caller is
+    /// responsible for removing the underlying RAM/overlay files first (this
+    /// only drops the rows) - see `list_snapshots_by_vm`.
+    pub fn delete_snapshots_for_vm(&self, vm_id: Uuid) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM snapshots WHERE vm_id = ?1",
+            params![vm_id.to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn insert_share(&self, share: &ShareRecord) -> Result<(), StoreError> {
@@ -646,6 +671,20 @@ impl Store {
         if n == 0 {
             return Err(StoreError::NotFound);
         }
+        Ok(())
+    }
+
+    /// Deletes every share record for a VM. Called when a VM is force-deleted
+    /// (vm-delete's purge path): its shares can never resolve again (the
+    /// `vm_id` they reference is gone for good, unlike a `stop_local` where
+    /// the VM - and so its shares - stay valid), so they must not be left as
+    /// permanent orphan rows. Zero matches is the common case (most VMs never
+    /// had a share) and is not an error.
+    pub fn delete_shares_for_vm(&self, vm_id: Uuid) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM shares WHERE vm_id = ?1",
+            params![vm_id.to_string()],
+        )?;
         Ok(())
     }
 

@@ -2712,6 +2712,64 @@ mod tests {
         assert!(vms.is_empty());
     }
 
+    // vm-delete capability, at the route layer (tasks 5.3/5.5 of
+    // vm-stop-delete-split - the underlying stop_local/purge_local logic
+    // already had unit coverage in ops.rs, but nothing exercised the actual
+    // `DELETE /v1/vms/{id}` route's `force` query-param parsing/dispatch
+    // end to end). Uses an already-`Stopped` fixture VM rather than a real
+    // running one - covering the boot/process side of stop/start is this
+    // repo's live-KVM gate scripts' job (see vmm/ci/overlay-reuse-gate.sh),
+    // this is specifically about the HTTP layer routing `force` correctly.
+    #[test]
+    fn delete_route_force_query_param_controls_purge_vs_retain() {
+        let (state, mut writes) = test_state_with_audit();
+        let id = Uuid::new_v4();
+        insert_vm(&state, id, "tenant-a", VmStatus::Stopped);
+        let app = router(state.clone());
+        let rt = test_runtime();
+
+        rt.block_on(async {
+            let writer = tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+
+            let retained = request_raw(
+                app.clone(),
+                "DELETE",
+                &format!("/v1/vms/{id}"),
+                Some("tenant-a-key"),
+                "",
+            )
+            .await;
+            assert_eq!(retained.status(), StatusCode::NO_CONTENT);
+            assert!(
+                state.store.lock().unwrap().get_vm(id).is_ok(),
+                "DELETE without ?force must retain the VM (equivalent to stop)"
+            );
+
+            let purged = request_raw(
+                app.clone(),
+                "DELETE",
+                &format!("/v1/vms/{id}?force=true"),
+                Some("tenant-a-key"),
+                "",
+            )
+            .await;
+            assert_eq!(purged.status(), StatusCode::NO_CONTENT);
+
+            writer.abort();
+        });
+
+        assert!(
+            state.store.lock().unwrap().get_vm(id).is_err(),
+            "DELETE ?force=true must actually purge the VM"
+        );
+    }
+
     #[test]
     fn tenant_quota_blocks_create_before_spawn() {
         let state = test_state();

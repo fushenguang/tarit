@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tarit_types::{CreateVmRequest, OrchError, RestartPolicy, VmRecord, VmStartupPath, VmStatus};
+use tarit_types::{
+    CreateVmRequest, OrchError, RestartPolicy, ShareRecord, ShareVisibility, VmRecord,
+    VmStartupPath, VmStatus,
+};
 use uuid::Uuid;
 
 use crate::api::{
@@ -1532,11 +1535,45 @@ pub async fn purge_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         start_terminal_transition(state, id, VmStatus::Stopped, true)?;
         finish_terminal_transition(state, id).await?;
     }
+    // Remove every snapshot ever taken of this VM: their RAM/overlay files
+    // are never referenced by the VM's own live overlay and have no other
+    // caller that ever cleans them up, so left in place after a force-delete
+    // they accumulate on disk forever. Must happen before the store rows
+    // are dropped below, since list_snapshots_by_vm needs them.
+    let snapshots = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .list_snapshots_by_vm(id)
+        .map_err(crate::api::store_err)?;
+    if !snapshots.is_empty() {
+        let sup = Arc::clone(&state.supervisor);
+        tokio::task::spawn_blocking(move || sup.purge_vm_snapshots(&snapshots))
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))?;
+    }
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .delete_snapshots_for_vm(id)
+        .map_err(crate::api::store_err)?;
     // The record is now durably `Stopped` with its disk already purged.
     // Remove it entirely rather than leaving a permanently unstartable
     // ghost row around - vm-restart's "start requires a retained disk"
     // rule would reject it anyway, so keeping the row adds nothing but
     // confusion.
+    //
+    // Also remove every share scoped to this VM: unlike `stop_local`, this
+    // `vm_id` is never coming back, so a share pointing at it can never
+    // resolve again - left in place it's a permanent orphan row that spams
+    // "not found in cluster" on every access attempt (observed in production).
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .delete_shares_for_vm(id)
+        .map_err(crate::api::store_err)?;
     state
         .store
         .lock()
@@ -3442,6 +3479,130 @@ mod tests {
             state.vm_cache.read().unwrap().get(&id).is_none(),
             "purge_local must evict the cache entry"
         );
+    }
+
+    // vm-delete capability: a purged VM's `vm_id` is gone for good, so any
+    // share pointing at it can never resolve again - production logs showed
+    // exactly this as repeated "share owner resolution failed ... not found
+    // in cluster" spam from an orphaned share left behind by a force-delete.
+    // Confirms purge_local also removes shares scoped to the purged VM, not
+    // just the VM's own row.
+    #[test]
+    fn purge_local_removes_shares_scoped_to_the_vm() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        let record = stopped_test_record(&state, id);
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
+
+        let now = Utc::now();
+        let share = ShareRecord {
+            id: Uuid::new_v4(),
+            slug: "purge-share-test".into(),
+            owner_key: "tenant-a".into(),
+            vm_id: id,
+            guest_port: 8080,
+            visibility: ShareVisibility::Private,
+            token_version: 0,
+            revoked_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state.store.lock().unwrap().insert_share(&share).unwrap();
+
+        test_runtime().block_on(async {
+            let writer = tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+            purge_local(&state, id).await.unwrap();
+            writer.abort();
+        });
+
+        assert!(
+            state.store.lock().unwrap().get_share(share.id).is_err(),
+            "purge_local must remove shares scoped to the purged VM, not leave them as orphans"
+        );
+    }
+
+    // vm-delete capability: a snapshot's RAM/overlay files are never
+    // referenced by the VM's own live overlay and have no other caller that
+    // ever cleans them up (only an admin's ad hoc pre-reboot backup workflow
+    // creates them today) - left behind by a force-delete they accumulate on
+    // disk forever. Confirms purge_local removes both the snapshot ownership
+    // rows and the actual files for every snapshot ever taken of the purged
+    // VM.
+    #[test]
+    fn purge_local_removes_snapshot_files_and_records_for_the_vm() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        let record = stopped_test_record(&state, id);
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
+
+        let root = std::env::temp_dir().join(format!(
+            "tarit-ops-purge-snapshot-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ram_path = root.join("bundle.ram");
+        let overlay_path = root.join("bundle-overlay.cow");
+        std::fs::write(&ram_path, b"ram").unwrap();
+        std::fs::write(&overlay_path, b"overlay").unwrap();
+
+        let now = Utc::now();
+        let snapshot = tarit_store::SnapshotRecord {
+            path: ram_path.display().to_string(),
+            overlay_path: Some(overlay_path.display().to_string()),
+            host_id: state.config.host_id.clone(),
+            owner_key: Some("test".into()),
+            api_key_id: None,
+            vm_id: id,
+            memory_mib: Some(256),
+            vcpus: Some(1),
+            kernel_path: Some("kernel".into()),
+            rootfs_path: None,
+            cmdline: Some("console=ttyS0".into()),
+            created_at: now,
+        };
+        state.store.lock().unwrap().insert_snapshot(&snapshot).unwrap();
+
+        test_runtime().block_on(async {
+            let writer = tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+            purge_local(&state, id).await.unwrap();
+            writer.abort();
+        });
+
+        assert!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .list_snapshots_by_vm(id)
+                .unwrap()
+                .is_empty(),
+            "purge_local must remove snapshot ownership rows for the purged VM"
+        );
+        assert!(
+            !ram_path.exists(),
+            "purge_local must remove the snapshot's RAM file from disk"
+        );
+        assert!(
+            !overlay_path.exists(),
+            "purge_local must remove the snapshot's overlay-copy file from disk"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // vm-restart capability: start only makes sense against a Stopped VM.

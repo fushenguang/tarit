@@ -421,6 +421,12 @@ actually destroy a VM's data. **BREAKING** relative to earlier versions of
 this API, which deleted the disk unconditionally on every `DELETE`: deleting
 data now always requires this explicit, deliberate `force=true` intent.
 
+`force=true` also removes every share record scoped to this VM (its `vm_id`
+can never resolve again) and every snapshot ever taken of it - the snapshot's
+RAM file and, if it was a full (non-diff) snapshot, its overlay-copy file are
+both deleted from disk along with the ownership row. Nothing related to a
+force-deleted VM is left behind.
+
 Response `204`: no body.
 
 Status codes: `204`, `401`, `403`, `404`, `500`.

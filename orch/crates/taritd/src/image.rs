@@ -479,12 +479,35 @@ fn remove_registered_file(images_dir: &Path, rootfs_path: &str) {
 mod tests {
     use super::*;
 
+    // Was `assert_eq!(default_vmm_agent(Path::new("/opt/tarit/bin/vmm")),
+    // "/opt/tarit/libexec/tarit/vmm-agent")` - not hermetic: it never created
+    // that file, relying on it *not* existing so the fallback chain's final
+    // `.or(installed)` returns the derived-but-absent path. That assumption
+    // broke on a real host that happens to have a real (stale, pre-dating
+    // any autostart work) `/usr/local/libexec/tarit/vmm-agent` on disk: the
+    // hardcoded-fallback branch above `.or(installed)` matches that real
+    // file first, before the derived path is ever reached. Rewritten to
+    // mirror `source_build_agent_wins_when_present` below: build a real,
+    // isolated prefix in a temp dir and actually create the installed-agent
+    // file, so the assertion holds regardless of what happens to exist
+    // elsewhere on the machine running the test.
     #[test]
-    fn installed_agent_is_derived_from_vmm_prefix() {
-        assert_eq!(
-            default_vmm_agent(Path::new("/opt/tarit/bin/vmm")),
-            PathBuf::from("/opt/tarit/libexec/tarit/vmm-agent")
-        );
+    fn installed_agent_wins_when_source_build_agent_is_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "tarit-image-agent-path-installed-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let vmm = root.join("bin/vmm");
+        let agent = root.join("libexec/tarit/vmm-agent");
+        std::fs::create_dir_all(vmm.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&vmm, []).unwrap();
+        std::fs::write(&agent, []).unwrap();
+
+        assert_eq!(default_vmm_agent(&vmm), agent);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

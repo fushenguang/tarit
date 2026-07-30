@@ -37,6 +37,16 @@ versions may contain breaking changes.
   verification. Interactive `run` and `create` commands can install it when no
   kernel path is supplied.
 
+### Fixed
+
+- `DELETE /v1/vms/{id}?force=true` now also removes every share record and
+  every snapshot (RAM file, and overlay-copy file for full snapshots) scoped
+  to the purged VM. Previously only the VM's own overlay disk and store row
+  were removed - shares became permanent orphan rows that could never
+  resolve again (observed in production as repeated "share owner resolution
+  failed ... not found in cluster" log spam), and snapshot files had no
+  cleanup path at all.
+
 ## [0.1.0] - 2026-07-03
 
 Initial public release of Tarit, a microVM platform for secure, fast,

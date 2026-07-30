@@ -3917,6 +3917,34 @@ impl VmmSupervisor {
         self.purge_vm_overlay(id)
     }
 
+    /// Remove the RAM (and, if present, overlay-copy) files backing a set of
+    /// snapshot ownership records. Called from `purge_local` for every
+    /// snapshot ever taken of a VM being force-deleted - otherwise those
+    /// files (never referenced by the VM's own overlay, and with no other
+    /// caller that ever cleans them up) accumulate on disk forever. Best-
+    /// effort per file, matching `purge_vm_overlay`: a file already gone
+    /// (e.g. a previous partial cleanup) is not an error, but the caller's
+    /// store-row deletion should still happen so a stuck file doesn't wedge
+    /// a VM's deletion.
+    pub fn purge_vm_snapshots(&self, records: &[tarit_store::SnapshotRecord]) {
+        for record in records {
+            if let Err(error) = remove_file_if_present(Path::new(&record.path)) {
+                tracing::warn!(
+                    path = %record.path,
+                    "remove snapshot RAM file failed: {error}"
+                );
+            }
+            if let Some(overlay_path) = record.overlay_path.as_deref() {
+                if let Err(error) = remove_file_if_present(Path::new(overlay_path)) {
+                    tracing::warn!(
+                        path = %overlay_path,
+                        "remove snapshot overlay-copy file failed: {error}"
+                    );
+                }
+            }
+        }
+    }
+
     fn defer_network_teardown(
         &self,
         id: Uuid,
