@@ -3153,8 +3153,9 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
             // order `new_with_mmio_hole` always builds them in) into one flat
             // buffer with no per-region metadata — read it back the same way,
             // region by region, off the same file cursor.
-            fill_split_guest_memory(&mem, &mut file)
-                .map_err(|e| VmmError::Snapshot(format!("read mem region in {path_display}: {e}")))?;
+            fill_split_guest_memory(&mem, &mut file).map_err(|e| {
+                VmmError::Snapshot(format!("read mem region in {path_display}: {e}"))
+            })?;
         } else {
             let mem_slice: &mut [u8] = {
                 // SAFETY: `mem` was just allocated with `mem_len` bytes and is owned here.
@@ -4416,7 +4417,8 @@ mod tests {
         // Distinct, position-independent fill per region so a
         // region-boundary bug (off-by-one, swapped order, wrong length)
         // shows up as a content mismatch instead of accidentally passing.
-        src.write_phys(0, &vec![0xAAu8; 8192]).expect("fill region 0");
+        src.write_phys(0, &vec![0xAAu8; 8192])
+            .expect("fill region 0");
         src.write_phys(gap_end, &vec![0xBBu8; 4096])
             .expect("fill region 1");
 

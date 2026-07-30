@@ -114,7 +114,7 @@ microVMs needs root (or membership in the `kvm` group), so the commands use
 ### Layer 1: run code in a microVM
 
 ```sh
-git clone https://github.com/instavm/tarit && cd tarit
+git clone https://github.com/fushenguang/tarit && cd tarit
 sudo make install      # build + install vmm, taritd, and the guest agent
 sudo make guest        # one-time: fetch a verified guest kernel + pull an Ubuntu rootfs
 ```
