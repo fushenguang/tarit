@@ -649,6 +649,20 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes every share record for a VM. Called when a VM is force-deleted
+    /// (vm-delete's purge path): its shares can never resolve again (the
+    /// `vm_id` they reference is gone for good, unlike a `stop_local` where
+    /// the VM - and so its shares - stay valid), so they must not be left as
+    /// permanent orphan rows. Zero matches is the common case (most VMs never
+    /// had a share) and is not an error.
+    pub fn delete_shares_for_vm(&self, vm_id: Uuid) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM shares WHERE vm_id = ?1",
+            params![vm_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_execution(&self, exec: &ExecutionRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO executions (

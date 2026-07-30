@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tarit_types::{CreateVmRequest, OrchError, RestartPolicy, VmRecord, VmStartupPath, VmStatus};
+use tarit_types::{
+    CreateVmRequest, OrchError, RestartPolicy, ShareRecord, ShareVisibility, VmRecord,
+    VmStartupPath, VmStatus,
+};
 use uuid::Uuid;
 
 use crate::api::{
@@ -3441,6 +3444,53 @@ mod tests {
         assert!(
             state.vm_cache.read().unwrap().get(&id).is_none(),
             "purge_local must evict the cache entry"
+        );
+    }
+
+    // vm-delete capability: a purged VM's `vm_id` is gone for good, so any
+    // share pointing at it can never resolve again - production logs showed
+    // exactly this as repeated "share owner resolution failed ... not found
+    // in cluster" spam from an orphaned share left behind by a force-delete.
+    // Confirms purge_local also removes shares scoped to the purged VM, not
+    // just the VM's own row.
+    #[test]
+    fn purge_local_removes_shares_scoped_to_the_vm() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        let record = stopped_test_record(&state, id);
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
+
+        let now = Utc::now();
+        let share = ShareRecord {
+            id: Uuid::new_v4(),
+            slug: "purge-share-test".into(),
+            owner_key: "tenant-a".into(),
+            vm_id: id,
+            guest_port: 8080,
+            visibility: ShareVisibility::Private,
+            token_version: 0,
+            revoked_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state.store.lock().unwrap().insert_share(&share).unwrap();
+
+        test_runtime().block_on(async {
+            let writer = tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+            purge_local(&state, id).await.unwrap();
+            writer.abort();
+        });
+
+        assert!(
+            state.store.lock().unwrap().get_share(share.id).is_err(),
+            "purge_local must remove shares scoped to the purged VM, not leave them as orphans"
         );
     }
 
