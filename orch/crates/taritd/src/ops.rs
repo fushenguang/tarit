@@ -10,10 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tarit_types::{
-    CreateVmRequest, OrchError, RestartPolicy, ShareRecord, ShareVisibility, VmRecord,
-    VmStartupPath, VmStatus,
-};
+use tarit_types::{CreateVmRequest, OrchError, RestartPolicy, VmRecord, VmStartupPath, VmStatus};
+#[cfg(test)]
+use tarit_types::{ShareRecord, ShareVisibility};
 use uuid::Uuid;
 
 use crate::api::{
