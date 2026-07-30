@@ -1540,6 +1540,17 @@ pub async fn purge_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     // ghost row around - vm-restart's "start requires a retained disk"
     // rule would reject it anyway, so keeping the row adds nothing but
     // confusion.
+    //
+    // Also remove every share scoped to this VM: unlike `stop_local`, this
+    // `vm_id` is never coming back, so a share pointing at it can never
+    // resolve again - left in place it's a permanent orphan row that spams
+    // "not found in cluster" on every access attempt (observed in production).
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .delete_shares_for_vm(id)
+        .map_err(crate::api::store_err)?;
     state
         .store
         .lock()

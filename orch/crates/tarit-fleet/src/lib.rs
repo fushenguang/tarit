@@ -542,6 +542,18 @@ impl PostgresFleet {
         Ok(())
     }
 
+    /// Deletes every fleet-wide share record for a VM. Mirrors
+    /// `tarit-store::delete_shares_for_vm` (sqlite, single-host) for the
+    /// Postgres-backed fleet registry: a force-deleted VM's shares can never
+    /// resolve again and must not be left as permanent orphan rows.
+    pub async fn delete_shares_for_vm(&self, vm_id: Uuid) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        client
+            .execute("DELETE FROM fleet_shares WHERE vm_id = $1", &[&vm_id])
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_share(&self, id: Uuid) -> Result<Option<ShareRecord>, FleetError> {
         let client = self.pool.get().await?;
         let row = client
