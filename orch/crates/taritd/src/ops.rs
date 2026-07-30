@@ -1504,7 +1504,9 @@ pub async fn purge_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     let sup = Arc::clone(&state.supervisor);
     let worker_converged = tokio::task::spawn_blocking(move || sup.cancel_and_wait_owned_task(id))
         .await
-        .map_err(|error| OrchError::Internal(format!("cancelled lifecycle wait join: {error}")))??;
+        .map_err(|error| {
+            OrchError::Internal(format!("cancelled lifecycle wait join: {error}"))
+        })??;
     if !worker_converged {
         let operation_gate = match state.supervisor.operation_gate(id) {
             Ok(gate) => Some(gate),
@@ -1751,8 +1753,8 @@ async fn reapply_egress_after_cold_start(state: &AppState, id: Uuid, existing: &
     };
     let allow_existing = existing.egress_allow_existing;
     let sup = Arc::clone(&state.supervisor);
-    let result = tokio::task::spawn_blocking(move || sup.update_egress(id, allowlist, allow_existing))
-        .await;
+    let result =
+        tokio::task::spawn_blocking(move || sup.update_egress(id, allowlist, allow_existing)).await;
     match result {
         Ok(Ok(rules)) => {
             tracing::info!(id = %id, rules, "start: reapplied persisted egress allowlist after cold start");
@@ -2014,9 +2016,10 @@ pub async fn egress_local(
     ensure_vm_status(state, id, "update egress for", LIVE_CONTROL_STATUSES)?;
     let sup = Arc::clone(&state.supervisor);
     let applied_allowlist = allowlist.clone();
-    let rules = tokio::task::spawn_blocking(move || sup.update_egress(id, allowlist, allow_existing))
-        .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+    let rules =
+        tokio::task::spawn_blocking(move || sup.update_egress(id, allowlist, allow_existing))
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
     // Persist independently of the tap/slot lifecycle in net.rs, whose
     // in-memory policy is wiped on every stop and reset to a fresh-allocation
     // default deny-all on every subsequent start. Without this, the enforced
@@ -3644,7 +3647,12 @@ mod tests {
             cmdline: Some("console=ttyS0".into()),
             created_at: now,
         };
-        state.store.lock().unwrap().insert_snapshot(&snapshot).unwrap();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert_snapshot(&snapshot)
+            .unwrap();
 
         test_runtime().block_on(async {
             let writer = tokio::spawn(async move {
@@ -3690,7 +3698,9 @@ mod tests {
         state.store.lock().unwrap().insert_vm(&record).unwrap();
         state.vm_cache.write().unwrap().insert(id, record);
 
-        let error = test_runtime().block_on(start_local(&state, id)).unwrap_err();
+        let error = test_runtime()
+            .block_on(start_local(&state, id))
+            .unwrap_err();
 
         assert!(
             matches!(error, OrchError::Conflict(_)),
@@ -3733,7 +3743,9 @@ mod tests {
         state.store.lock().unwrap().insert_vm(&record).unwrap();
         state.vm_cache.write().unwrap().insert(id, record);
 
-        let error = test_runtime().block_on(start_local(&state, id)).unwrap_err();
+        let error = test_runtime()
+            .block_on(start_local(&state, id))
+            .unwrap_err();
 
         assert!(
             matches!(error, OrchError::NotFound(_)),

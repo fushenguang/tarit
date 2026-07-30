@@ -177,8 +177,9 @@ impl PostgresFleet {
                     &vm.owner_key,
                     &vm.api_key_id,
                     &vm.status.as_str(),
-                    &i64::try_from(vm.revision)
-                        .map_err(|_| FleetError::Config("VM revision exceeds PostgreSQL BIGINT".into()))?,
+                    &i64::try_from(vm.revision).map_err(|_| {
+                        FleetError::Config("VM revision exceeds PostgreSQL BIGINT".into())
+                    })?,
                     &vm.startup_path.map(VmStartupPath::as_str),
                     &vm.restart_policy.as_str(),
                     &(vm.memory_mib as i64),

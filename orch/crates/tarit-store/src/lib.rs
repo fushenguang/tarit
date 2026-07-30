@@ -230,12 +230,7 @@ impl Store {
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
         ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "vms", "startup_path", "TEXT")?;
-        ensure_column(
-            &conn,
-            "vms",
-            "restart_policy",
-            "TEXT NOT NULL DEFAULT 'no'",
-        )?;
+        ensure_column(&conn, "vms", "restart_policy", "TEXT NOT NULL DEFAULT 'no'")?;
         ensure_column(&conn, "vms", "egress_allowlist", "TEXT")?;
         ensure_column(
             &conn,
@@ -390,7 +385,8 @@ impl Store {
              FROM snapshots WHERE vm_id = ?1",
         )?;
         let rows = stmt.query_map(params![vm_id.to_string()], row_to_snapshot)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::from)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// Deletes every snapshot ownership record for a VM. The caller is
@@ -1099,7 +1095,11 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
     let egress_allowlist = egress_allowlist_json
         .map(|json| {
             serde_json::from_str::<Vec<String>>(&json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(17, rusqlite::types::Type::Text, Box::new(e))
+                rusqlite::Error::FromSqlConversionFailure(
+                    17,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
             })
         })
         .transpose()?;
