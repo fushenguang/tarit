@@ -3505,6 +3505,83 @@ mod tests {
         );
     }
 
+    // vm-delete capability: a snapshot's RAM/overlay files are never
+    // referenced by the VM's own live overlay and have no other caller that
+    // ever cleans them up (only an admin's ad hoc pre-reboot backup workflow
+    // creates them today) - left behind by a force-delete they accumulate on
+    // disk forever. Confirms purge_local removes both the snapshot ownership
+    // rows and the actual files for every snapshot ever taken of the purged
+    // VM.
+    #[test]
+    fn purge_local_removes_snapshot_files_and_records_for_the_vm() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let id = Uuid::new_v4();
+        let record = stopped_test_record(&state, id);
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
+
+        let root = std::env::temp_dir().join(format!(
+            "tarit-ops-purge-snapshot-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let ram_path = root.join("bundle.ram");
+        let overlay_path = root.join("bundle-overlay.cow");
+        std::fs::write(&ram_path, b"ram").unwrap();
+        std::fs::write(&overlay_path, b"overlay").unwrap();
+
+        let now = Utc::now();
+        let snapshot = tarit_store::SnapshotRecord {
+            path: ram_path.display().to_string(),
+            overlay_path: Some(overlay_path.display().to_string()),
+            host_id: state.config.host_id.clone(),
+            owner_key: Some("test".into()),
+            api_key_id: None,
+            vm_id: id,
+            memory_mib: Some(256),
+            vcpus: Some(1),
+            kernel_path: Some("kernel".into()),
+            rootfs_path: None,
+            cmdline: Some("console=ttyS0".into()),
+            created_at: now,
+        };
+        state.store.lock().unwrap().insert_snapshot(&snapshot).unwrap();
+
+        test_runtime().block_on(async {
+            let writer = tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+            purge_local(&state, id).await.unwrap();
+            writer.abort();
+        });
+
+        assert!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .list_snapshots_by_vm(id)
+                .unwrap()
+                .is_empty(),
+            "purge_local must remove snapshot ownership rows for the purged VM"
+        );
+        assert!(
+            !ram_path.exists(),
+            "purge_local must remove the snapshot's RAM file from disk"
+        );
+        assert!(
+            !overlay_path.exists(),
+            "purge_local must remove the snapshot's overlay-copy file from disk"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     // vm-restart capability: start only makes sense against a Stopped VM.
     #[test]
     fn start_local_rejects_a_vm_that_is_not_stopped() {
