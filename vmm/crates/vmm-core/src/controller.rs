@@ -2414,7 +2414,7 @@ fn fill_split_guest_memory(
         // shared — region.as_ptr()/len() describe a live mmap'd region we
         // exclusively own for the lifetime of this call.
         let region_slice: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(region.as_ptr() as *mut u8, len) };
+            unsafe { std::slice::from_raw_parts_mut(region.as_ptr(), len) };
         file.read_exact(region_slice)?;
     }
     Ok(())
