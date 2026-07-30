@@ -667,6 +667,8 @@ mod tests {
             revision: 1,
             startup_path: Some(tarit_types::VmStartupPath::Cold),
             restart_policy: RestartPolicy::No,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "/tmp/vmlinux".into(),

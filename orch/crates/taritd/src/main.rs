@@ -1089,6 +1089,8 @@ mod tests {
             revision: 1,
             startup_path: None,
             restart_policy,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),

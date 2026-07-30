@@ -4740,6 +4740,8 @@ mod tests {
             revision: 7,
             startup_path: None,
             restart_policy: tarit_types::RestartPolicy::No,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),

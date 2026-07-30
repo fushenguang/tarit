@@ -137,6 +137,15 @@ pub struct VmRecord {
     /// field.
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// Guest egress allowlist last configured via `PATCH /v1/egress/vm/{id}`,
+    /// kept independent of the tap/slot lifecycle in `net.rs` so a cold start
+    /// can reapply it instead of resetting to a fresh-allocation default
+    /// deny-all policy. `None` means egress has never been explicitly
+    /// configured for this VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub egress_allow_existing: bool,
     pub memory_mib: u64,
     pub vcpus: u8,
     pub kernel_path: String,
@@ -681,6 +690,8 @@ mod tests {
             revision: 2,
             startup_path: Some(VmStartupPath::Cold),
             restart_policy: RestartPolicy::No,
+            egress_allowlist: None,
+            egress_allow_existing: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "/srv/private/vmlinux".into(),
