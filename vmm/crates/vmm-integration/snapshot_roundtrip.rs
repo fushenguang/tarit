@@ -5,9 +5,13 @@
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
 use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
+use vmm_core::controller::VmmController;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
 mod test_support;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
+use test_support::assert_guest_exec;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
 fn workspace_path(rel: &str) -> PathBuf {
@@ -29,6 +33,14 @@ fn local_test_dir(name: &str) -> PathBuf {
         workspace_path("target/test-work").join(format!("{name}-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
+fn retain_overlay(controller: &VmmController, path: &Path) {
+    let identity = vmm_core::gc::OwnedScratchFile::identity_for(path).expect("overlay identity");
+    controller
+        .release_scratch(&path.to_string_lossy(), identity)
+        .expect("release overlay ownership");
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
@@ -97,10 +109,13 @@ fn restored_clones_get_private_rootfs_overlays() {
     golden
         .create_live(config(&golden_overlay))
         .expect("boot golden");
-    let (code, _, _) = golden
-        .exec("true", 30_000)
-        .expect("golden must be command-ready before snapshot");
-    assert_eq!(code, 0, "golden readiness command must succeed");
+    // The freshly-booted golden VM's guest agent may not be ready to accept
+    // exec calls the instant create_live() returns, especially on a loaded/
+    // nested-virt host - a single one-shot exec with no retry made this
+    // spuriously fail here (30s timeout) while every other boot-based test
+    // in this suite tolerates the same startup jitter via assert_guest_exec's
+    // retry loop (up to 90s, retrying every 250ms). See fushenguang/tarit#11.
+    assert_guest_exec(&golden, "true", "");
     let snap_path = golden.snapshot(false).expect("snapshot golden");
     let snapshot_identity = vmm_core::gc::OwnedScratchFile::identity_for(Path::new(&snap_path))
         .expect("snapshot identity");
@@ -108,6 +123,17 @@ fn restored_clones_get_private_rootfs_overlays() {
         .release_scratch(&snap_path, snapshot_identity)
         .expect("transfer golden snapshot ownership");
     artifacts.snapshots.push(PathBuf::from(&snap_path));
+    // Every VM's overlay created via create_live()/restore() is tracked as
+    // owned scratch (vmm-core/src/controller.rs's OwnedOverlayGuard) and
+    // gets deleted on drop/stop unless explicitly released, same as the
+    // snapshot above. This test reads each overlay from disk after its VM
+    // stops (golden's for the byte-identity check at the end, clone A/B's
+    // for the inode-uniqueness check), so all three must survive stop().
+    // Missing these releases made the overlays vanish on stop(), which the
+    // test only surfaced once its unrelated no-retry readiness-check bug
+    // (see above) was fixed and the test actually got to run this far.
+    // See fushenguang/tarit#11.
+    retain_overlay(&golden, &golden_overlay);
     golden.stop().ok();
     let original_golden_overlay =
         std::fs::read(&golden_overlay).expect("read reusable golden overlay");
@@ -120,6 +146,7 @@ fn restored_clones_get_private_rootfs_overlays() {
         .exec(&format!("sh -c 'echo clone-a > {marker} && sync'"), 30_000)
         .expect("write marker in clone A");
     assert_eq!(code, 0, "clone A marker write must succeed");
+    retain_overlay(&clone_a, &overlay_a);
     clone_a.stop().ok();
 
     let clone_b = VmmController::new();
@@ -139,6 +166,7 @@ fn restored_clones_get_private_rootfs_overlays() {
         .expect("execute command in clone B");
     assert_eq!(code, 0, "clone B command must succeed: {out}");
     assert!(out.contains("clone-b"));
+    retain_overlay(&clone_b, &overlay_b);
     clone_b.stop().ok();
 
     #[cfg(unix)]
