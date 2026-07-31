@@ -112,7 +112,7 @@ SOURCE_ID=$(printf '%s' "$SOURCE_JSON" | json_field id)
 exec_json "$SOURCE_ID" "sh -c 'echo snapshot-checkpoint > /root/tarit-snapshot-state; sync'" |
   grep -q '"exit_code":0'
 
-echo "== snapshot, mutate source, then delete it =="
+echo "== snapshot, then mutate source =="
 SNAPSHOT_START_MS=$(python3 -c 'import time; print(time.monotonic_ns() // 1000000)')
 SNAPSHOT_JSON=$(api -H 'Content-Type: application/json' -d '{"diff":false}' \
   "$BASE_URL/v1/vms/$SOURCE_ID/snapshot")
@@ -122,11 +122,6 @@ SNAPSHOT_PATH=$(printf '%s' "$SNAPSHOT_JSON" | json_field path)
 [ -f "$SNAPSHOT_PATH" ]
 exec_json "$SOURCE_ID" "sh -c 'echo post-snapshot-mutation > /root/tarit-snapshot-state; sync'" |
   grep -q '"exit_code":0'
-api -X DELETE "$BASE_URL/v1/vms/$SOURCE_ID" >/dev/null
-[ ! -e "$DIR/sockets/overlays/$SOURCE_ID.cow" ] || {
-  echo "FAIL: source VM overlay survived deletion"
-  exit 1
-}
 
 echo "== restore twice from the snapshot-owned disk artifact =="
 RESTORE_A=$(api -H 'Content-Type: application/json' \
@@ -153,6 +148,16 @@ if printf '%s' "$B_STATE" | grep -q 'restore-a-private'; then
   exit 1
 fi
 
-api -X DELETE "$BASE_URL/v1/vms/$A_ID" >/dev/null
-api -X DELETE "$BASE_URL/v1/vms/$B_ID" >/dev/null
+# Force-delete the source last, after every use of its snapshot is done:
+# purge cascades to every snapshot ever taken of the VM being deleted (see
+# ops::purge_local), so deleting it earlier would have destroyed
+# SNAPSHOT_PATH out from under the restores above.
+api -X DELETE "$BASE_URL/v1/vms/$SOURCE_ID?force=true" >/dev/null
+[ ! -e "$DIR/sockets/overlays/$SOURCE_ID.cow" ] || {
+  echo "FAIL: source VM overlay survived force-deletion"
+  exit 1
+}
+
+api -X DELETE "$BASE_URL/v1/vms/$A_ID?force=true" >/dev/null
+api -X DELETE "$BASE_URL/v1/vms/$B_ID?force=true" >/dev/null
 echo "RESULT: SNAPSHOT_DISK_PASS source=$SOURCE_ID restore_a=$A_ID restore_b=$B_ID snapshot_capture_ms=$SNAPSHOT_CAPTURE_MS"
