@@ -2370,12 +2370,43 @@ fn ingress_table_owner(listing: &str, slot: u32) -> Option<NetAlloc> {
         .and_then(|vm_id| NetAlloc::for_slot(vm_id, slot).ok())
 }
 
+fn ingress_table_listing_is_empty(listing: &str, slot: u32) -> bool {
+    let Some(tokens) = nft_listing_tokens(listing) else {
+        return false;
+    };
+    let table_header = vec![
+        "table".to_string(),
+        "netdev".to_string(),
+        ingress_table_name(slot),
+        "{".to_string(),
+    ];
+    let mut index = 0;
+    consume_nft_tokens(&tokens, &mut index, &table_header)
+        && tokens.get(index) == Some(&"}".to_string())
+        && index + 1 == tokens.len()
+}
+
 fn delete_ingress_table_for_slot(slot: u32) -> Result<usize, OrchError> {
     let table = ingress_table_name(slot);
     if !ingress_table_names()?.iter().any(|name| name == &table) {
         return Ok(0);
     }
     let listing = command_stdout("nft", &["-a", "list", "table", "netdev", &table])?;
+    // The kernel drops a netdev-hooked chain (and with it, this table's only
+    // chain) once its target TAP device is gone - an empty table under our
+    // generated per-slot name is the expected post-teardown shape (see
+    // ingress_table_belongs_to_alloc's identical handling below), not
+    // evidence that we can't identify an owner. There is nothing left in it
+    // to protect, so it is always safe to delete outright without an owner
+    // match. Without this, a start() that lands on a slot whose previous
+    // occupant's TAP teardown already emptied the table hard-failed net
+    // provisioning with "exact managed owner is unknown" even though the
+    // table posed no risk - observed in production after rapid repeated
+    // stop/start cycles on the same VM (fushenguang/tarit#13).
+    if ingress_table_listing_is_empty(&listing, slot) {
+        run_argv(&delete_ingress_table_argv(slot))?;
+        return Ok(1);
+    }
     let alloc = ingress_table_owner(&listing, slot).ok_or_else(|| {
         OrchError::Internal(format!(
             "net: refusing to delete ingress table {table}: exact managed owner is unknown"
