@@ -443,7 +443,30 @@ impl VirtQueueProcessor {
         })
     }
 
-    fn reject_available_chain(&mut self) {
+    fn reject_available_chain(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        head_desc_idx: u16,
+    ) {
+        // A rejected chain is malformed/untrusted guest input - we cannot
+        // safely interpret its descriptors to write a real virtio-blk status
+        // byte (that is exactly what walk_descriptor_chain refused to
+        // validate), but we MUST still complete it in the used ring. Without
+        // this the guest driver waits forever for a completion that will
+        // never come: Linux's block layer has no client-side timeout for an
+        // individual bio, so a single rejected descriptor (e.g. one
+        // exceeding MAX_DESC_LEN) permanently hung whatever process issued
+        // the write, unkillable (D state) - observed in production during
+        // large sequential writes (fushenguang/tarit#13).
+        let used_elem = UsedElem {
+            id: head_desc_idx as u32,
+            len: 0,
+        };
+        if let Some(used_entry_addr) = self.used_entry_addr() {
+            let _ = write_obj_mem(mem, dirty, used_elem, used_entry_addr);
+            self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        }
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
     }
 
@@ -509,7 +532,8 @@ impl VirtQueueProcessor {
             let chain = match self.walk_descriptor_chain(mem, head_desc_idx) {
                 Some(chain) => chain,
                 None => {
-                    self.reject_available_chain();
+                    self.reject_available_chain(mem, dirty, head_desc_idx);
+                    processed += 1;
                     continue;
                 }
             };
@@ -685,7 +709,8 @@ impl VirtQueueProcessor {
             let chain = match self.walk_descriptor_chain(mem, head_desc_idx) {
                 Some(chain) => chain,
                 None => {
-                    self.reject_available_chain();
+                    self.reject_available_chain(mem, dirty, head_desc_idx);
+                    processed += 1;
                     continue;
                 }
             };
@@ -877,9 +902,13 @@ mod tests {
         let count = p.process_queue(&mem, |_readable, _writable| {
             panic!("malformed descriptor must be rejected before handler");
         });
-        assert_eq!(count, 0);
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
+        assert_eq!(count, 1);
         assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
+        assert_eq!(p.used_idx(), 1);
     }
 
     #[test]
@@ -906,9 +935,13 @@ mod tests {
         let count = p.process_queue(&mem, |_, _| {
             panic!("oversized descriptor must be rejected before handler");
         });
-        assert_eq!(count, 0);
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
+        assert_eq!(count, 1);
         assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
+        assert_eq!(p.used_idx(), 1);
     }
 
     #[test]
@@ -937,9 +970,13 @@ mod tests {
         let count = p.process_queue(&mem, |_, _| {
             panic!("out-of-range next descriptor must be rejected");
         });
-        assert_eq!(count, 0);
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
+        assert_eq!(count, 1);
         assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
+        assert_eq!(p.used_idx(), 1);
     }
 
     #[test]
@@ -972,9 +1009,13 @@ mod tests {
         let count = p.process_queue(&mem, |_, _| {
             panic!("looping descriptor chain must be rejected");
         });
-        assert_eq!(count, 0);
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
+        assert_eq!(count, 1);
         assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
+        assert_eq!(p.used_idx(), 1);
     }
 
     #[test]
@@ -1000,9 +1041,13 @@ mod tests {
         let count = p.process_queue(&mem, |_, _| {
             panic!("overflowing descriptor address must be rejected");
         });
-        assert_eq!(count, 0);
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
+        assert_eq!(count, 1);
         assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
+        assert_eq!(p.used_idx(), 1);
     }
 
     #[test]
@@ -1027,9 +1072,13 @@ mod tests {
         let count = p.process_queue_descriptors(&mem, |_, _| {
             panic!("looping descriptor chain must be rejected before handler");
         });
-        assert_eq!(count, 0);
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
+        assert_eq!(count, 1);
         assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
+        assert_eq!(p.used_idx(), 1);
     }
 
     #[test]
@@ -1093,9 +1142,13 @@ mod tests {
         let count = p.process_queue(&mem, |_, _| {
             panic!("over-large descriptor chain must be rejected before handler");
         });
-        assert_eq!(count, 0);
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
+        assert_eq!(count, 1);
         assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
+        assert_eq!(p.used_idx(), 1);
     }
 
     #[test]
@@ -1124,9 +1177,13 @@ mod tests {
         let count = p.process_queue(&mem, |_, _| {
             panic!("OOB writable descriptor must be rejected before handler");
         });
-        assert_eq!(count, 0);
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
+        assert_eq!(count, 1);
         assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
+        assert_eq!(p.used_idx(), 1);
     }
 
     #[test]
