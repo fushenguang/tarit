@@ -14,6 +14,33 @@ developed together:
 - `proto/` — `tarit-proto`, the shared UDS wire-protocol crate (KVM-free),
   depended on by both.
 
+## Architecture principle: minimal device model (hard rule)
+
+`vmm-core` inherits Firecracker's device-model philosophy on purpose (see
+`NOTICE` — the ACPI tables and boot protocol are directly adapted from
+Firecracker, on the same rust-vmm crate stack): a deliberately minimal set of
+emulated hardware. No RTC, no PCI, no ACPI beyond the minimum boot needs, no
+USB, no VGA, no legacy PC peripherals. This is not an oversight to "complete"
+later — it's the reason this platform boots in milliseconds and has a small
+attack surface. Every emulated device is new guest-controlled I/O surface,
+and that is exactly the class of code a hypervisor escape lives in.
+
+**Do not add new emulated hardware devices to close a guest-visibility gap.**
+If a guest needs to know something the host already knows — time, host
+state, config, secrets, anything — solve it through the existing paravirtual
+agent channel (`vmm-agent` over vsock/serial, the same `exec` RPC `taritd`
+already uses for boot-readiness probing and `/v1/execute`) or at the
+taritd/vmm-core platform layer, not through new hardware emulation. See
+`VmmSupervisor::sync_guest_clock` (`orch/crates/taritd/src/supervisor.rs`)
+for the pattern: the guest clock problem looked like "add an RTC device," but
+the actual fix is one more `exec` call through the channel that already
+exists — no new protocol, no guest kernel/image change, no new device.
+
+If a task genuinely seems to require new device emulation, that's a
+significant architectural decision, not a routine implementation choice:
+stop and explicitly justify in the PR/commit why the paravirtual/
+platform-layer route doesn't work, before writing any `vmm-devices` code.
+
 ## Fork policy
 
 This fork does not track upstream mergeability — it moves faster and diverges
