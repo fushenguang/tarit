@@ -707,8 +707,12 @@ mod tests {
         assert!(notify.is_ok(), "OOB descriptor must not panic");
         notify.unwrap().unwrap();
 
+        // Rejected chains must still complete in the used ring (with a
+        // zero-length completion) so the guest is never left waiting
+        // forever for a response that will never come - see
+        // reject_available_chain's doc comment / fushenguang/tarit#13.
         let used_idx: u16 = mem.read_obj(GuestAddress(USED + 2)).unwrap();
-        assert_eq!(used_idx, 0);
+        assert_eq!(used_idx, 1);
     }
 
     #[test]
