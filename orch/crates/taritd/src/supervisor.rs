@@ -2562,7 +2562,51 @@ impl VmmSupervisor {
                 "guest agent never became ready at {}: {last}",
                 socket.display()
             )),
-        })
+        })?;
+        self.sync_guest_clock(socket);
+        Ok(())
+    }
+
+    /// Sync the guest's wall clock to the host's, right after boot readiness
+    /// is confirmed. vmm-core deliberately doesn't emulate an RTC device
+    /// (matching the minimal Firecracker-derived device model this platform
+    /// inherits, and the guest kernel doesn't even enable CONFIG_RTC_CLASS),
+    /// so without this the guest's clock free-runs from whatever the kernel's
+    /// own boot-time default is - observed decades off in practice. This
+    /// runs unconditionally on every cold boot, through the one gate every
+    /// boot path (create/start/restore/warm refill) already funnels through
+    /// via `await_ready`, so no caller needs to remember to do it themselves.
+    /// That's what closes this gap for callers other than Huntaway, e.g. the
+    /// `restart_policy` sweep.
+    ///
+    /// Best-effort: boot readiness was already confirmed above, so a sync
+    /// failure here is logged rather than failing an otherwise-successful
+    /// boot.
+    fn sync_guest_clock(&self, socket: &Path) {
+        let Ok(epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return;
+        };
+        let client = VmmClient::new(socket)
+            .with_connect_timeout(Duration::from_secs(5))
+            .with_request_timeout(Duration::from_secs(5));
+        match client.exec(&format!("date -u -s @{}", epoch.as_secs()), 5_000) {
+            Ok((0, _, _, _)) => {}
+            Ok((code, _, stderr, _)) => {
+                tracing::warn!(
+                    socket = %socket.display(),
+                    code,
+                    stderr,
+                    "boot: guest clock sync command exited non-zero"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    socket = %socket.display(),
+                    %error,
+                    "boot: could not sync guest clock after boot readiness"
+                );
+            }
+        }
     }
 
     pub(crate) async fn spawn_warm(self: Arc<Self>, class: WarmClass) -> Result<(), OrchError> {
