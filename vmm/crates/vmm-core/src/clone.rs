@@ -152,24 +152,57 @@ pub fn create_cow_overlay(base_path: &str, overlay_path: &str) -> Result<(), Str
 
     let src_size = src.metadata().map_err(|e| format!("metadata: {e}"))?.len();
 
-    // Use copy_file_range for efficient CoW on supported filesystems.
-    // SAFETY: `src` and `dst` are valid file descriptors, offsets are null so
-    // the kernel uses and updates each fd's current offset, and `src_size` comes
-    // from the source file metadata.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_copy_file_range,
-            src.as_raw_fd(),
-            std::ptr::null::<i64>(),
-            dst.as_raw_fd(),
-            std::ptr::null::<i64>(),
-            src_size as usize,
-            0u32,
-        )
-    };
+    // copy_file_range does NOT guarantee copying the full requested length in
+    // one call -- per copy_file_range(2), "a successful call may copy fewer
+    // than len bytes", and this is not an error. The caller must loop over
+    // the remaining bytes. The previous version of this function checked
+    // only `ret < 0` (hard failure) and treated any non-negative return as
+    // "fully copied", silently leaving the overlay's tail as whatever
+    // truncate(true) left it (typically a sparse hole, i.e. zeros) whenever
+    // the kernel returned a short count -- verified live in production: this
+    // produced VM overlays with real files (e.g. a 12.8MB pnpm.mjs) corrupted
+    // partway through, non-deterministically, under I/O pressure.
+    let mut copied: u64 = 0;
+    let mut copy_file_range_failed = false;
+    while copied < src_size {
+        let mut src_off = copied as i64;
+        let mut dst_off = copied as i64;
+        let remaining = (src_size - copied) as usize;
+        // SAFETY: `src` and `dst` are valid file descriptors kept alive for
+        // the duration of this call; `src_off`/`dst_off` are valid `i64`
+        // lvalues the kernel reads the starting offset from and writes the
+        // post-copy offset back into.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                src.as_raw_fd(),
+                &mut src_off as *mut i64,
+                dst.as_raw_fd(),
+                &mut dst_off as *mut i64,
+                remaining,
+                0u32,
+            )
+        };
+        if ret < 0 {
+            copy_file_range_failed = true;
+            break;
+        }
+        if ret == 0 {
+            // Zero with bytes still remaining means the kernel hit EOF on
+            // the source before `src_size` -- the base file changed size
+            // underneath us, or metadata() lied. Either way, silently
+            // treating this as success would ship a truncated overlay.
+            return Err(format!(
+                "copy_file_range returned 0 with {} bytes still remaining (base file may have changed size)",
+                src_size - copied
+            ));
+        }
+        copied += ret as u64;
+    }
 
-    if ret < 0 {
-        // Fallback: regular copy.
+    if copy_file_range_failed {
+        // Fallback: regular copy. Re-truncate first -- copy_file_range may
+        // have partially written the destination before failing.
         let mut src = fs::File::open(base_path).map_err(|e| format!("reopen: {e}"))?;
         std::io::copy(
             &mut src,
@@ -251,5 +284,74 @@ mod tests {
     fn overlay_paths_none_when_no_volume() {
         let specs = build_clone_specs("base", "/snap.bin", None, 2, "/tmp");
         assert!(specs[0].overlay_path.is_none());
+    }
+}
+
+#[cfg(test)]
+mod create_cow_overlay_tests {
+    use super::create_cow_overlay;
+    use std::fs;
+    use std::io::Write;
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-work")
+            .join(format!("{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Regression test for a real bug: create_cow_overlay used to check only
+    // `ret < 0` from copy_file_range and treat any non-negative return as a
+    // full copy, even though copy_file_range(2) explicitly does not
+    // guarantee copying the full requested length in one call. A large
+    // patterned file (multi-MB, larger than a single typical copy_file_range
+    // chunk) exercises the loop; byte-for-byte equality is the only thing
+    // that matters here.
+    #[test]
+    fn overlay_matches_base_byte_for_byte_for_a_large_file() {
+        let dir = scratch_dir("cow-overlay-large");
+        let base = dir.join("base.img");
+        let overlay = dir.join("overlay.img");
+
+        // 8 MiB of non-repeating content so a truncated/short copy is
+        // detectable anywhere in the file, not just at a fixed offset.
+        let mut f = fs::File::create(&base).unwrap();
+        let mut buf = vec![0u8; 8 * 1024 * 1024];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i % 251) as u8; // 251 is prime, avoids trivial 256-periodicity
+        }
+        f.write_all(&buf).unwrap();
+        drop(f);
+
+        create_cow_overlay(base.to_str().unwrap(), overlay.to_str().unwrap())
+            .expect("create_cow_overlay should succeed");
+
+        let overlay_bytes = fs::read(&overlay).unwrap();
+        assert_eq!(
+            overlay_bytes.len(),
+            buf.len(),
+            "overlay must be the same length as the base file"
+        );
+        assert_eq!(
+            overlay_bytes, buf,
+            "overlay content must match the base file byte-for-byte"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overlay_matches_base_for_a_small_file() {
+        let dir = scratch_dir("cow-overlay-small");
+        let base = dir.join("base.img");
+        let overlay = dir.join("overlay.img");
+        fs::write(&base, b"hello cow overlay").unwrap();
+
+        create_cow_overlay(base.to_str().unwrap(), overlay.to_str().unwrap())
+            .expect("create_cow_overlay should succeed");
+
+        assert_eq!(fs::read(&overlay).unwrap(), b"hello cow overlay");
+        fs::remove_dir_all(dir).unwrap();
     }
 }
