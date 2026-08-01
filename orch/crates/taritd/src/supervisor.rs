@@ -1339,7 +1339,7 @@ impl VmmSupervisor {
             .checked_add(shape.memory_mib / 2)
             .and_then(|value| value.checked_add(256))
             .ok_or_else(|| OrchError::BadRequest("memory cgroup limit overflow".into()))?;
-        Ok(vec![
+        let mut args = vec![
             "--cgroup".to_string(),
             path.display().to_string(),
             "--cgroup-pids-max".to_string(),
@@ -1348,7 +1348,12 @@ impl VmmSupervisor {
             format!("{cpu_millis}m"),
             "--cgroup-memory-max".to_string(),
             format!("{max_mib}M"),
-        ])
+        ];
+        if let Some(cpuset) = self.config.vm_cgroup_cpuset.as_ref() {
+            args.push("--cpuset".to_string());
+            args.push(cpuset.clone());
+        }
+        Ok(args)
     }
 
     /// The VMM creates this child and applies the VM's exact CPU, memory and PID
@@ -4691,6 +4696,7 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_cgroup_cpuset: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
@@ -4756,6 +4762,7 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_cgroup_cpuset: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
@@ -5303,6 +5310,59 @@ mod tests {
             assert_eq!(args[cpu_index + 1], cpu);
             assert_eq!(args[memory_index + 1], memory);
         }
+    }
+
+    #[test]
+    fn cgroup_args_omit_cpuset_when_unconfigured() {
+        let root = PathBuf::from(format!("target/cgroup-args-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.vm_cgroup_parent = Some("/sys/fs/cgroup/tarit".into());
+        assert!(config.vm_cgroup_cpuset.is_none());
+        let supervisor = VmmSupervisor::new(config);
+        let args = supervisor
+            .cgroup_args(Uuid::new_v4(), ResourceShape::new(4, 8192))
+            .unwrap();
+        assert!(
+            !args.iter().any(|arg| arg == "--cpuset"),
+            "no --cpuset should be emitted when vm_cgroup_cpuset is unset: {args:?}"
+        );
+    }
+
+    #[test]
+    fn cgroup_args_include_cpuset_when_configured() {
+        let root = PathBuf::from(format!("target/cgroup-args-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.vm_cgroup_parent = Some("/sys/fs/cgroup/tarit".into());
+        config.vm_cgroup_cpuset = Some("4-11".into());
+        let supervisor = VmmSupervisor::new(config);
+        let args = supervisor
+            .cgroup_args(Uuid::new_v4(), ResourceShape::new(4, 8192))
+            .unwrap();
+        let cpuset_index = args
+            .iter()
+            .position(|arg| arg == "--cpuset")
+            .expect("--cpuset must be present when vm_cgroup_cpuset is set");
+        assert_eq!(args[cpuset_index + 1], "4-11");
+    }
+
+    #[test]
+    fn cgroup_args_are_empty_without_a_configured_parent() {
+        // Every field this test doesn't set stays at its struct default via
+        // supervisor_config(); confirm cpuset alone can't turn cgroup_args on
+        // without vm_cgroup_parent, since exact_vm_cgroup_path short-circuits
+        // on that field first.
+        let root = PathBuf::from(format!("target/cgroup-args-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.vm_cgroup_cpuset = Some("4-11".into());
+        assert!(config.vm_cgroup_parent.is_none());
+        let supervisor = VmmSupervisor::new(config);
+        let args = supervisor
+            .cgroup_args(Uuid::new_v4(), ResourceShape::new(4, 8192))
+            .unwrap();
+        assert!(
+            args.is_empty(),
+            "cgroup_args must stay empty when vm_cgroup_parent is unset, even if cpuset is configured: {args:?}"
+        );
     }
 
     #[test]

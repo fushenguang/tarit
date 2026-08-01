@@ -525,6 +525,16 @@ pub struct Config {
     /// pids.max for each per-VM cgroup (fork-bomb ceiling). Env
     /// TARIT_VM_CGROUP_PIDS_MAX. Only used when `vm_cgroup_parent` is set.
     pub vm_cgroup_pids_max: u64,
+    /// cpuset.cpus for each per-VM cgroup, e.g. `4-11` — restricts every VM's
+    /// vCPU threads to the physical cores reserved for Tarit at the host
+    /// level (see scripts/ops/configure-tarit-cpuset-and-memory.sh in
+    /// cogito-lib), so a VM can never spill onto Docker/desktop's cores.
+    /// Every VM gets the *same* range; per-VM fairness among VMs sharing it
+    /// comes from `vm_cgroup_cpu_max`-derived quota (via `cgroup_args`), not
+    /// from disjoint cpuset ranges — there usually aren't enough physical
+    /// cores to give each concurrent VM its own exclusive slice. Env
+    /// TARIT_VM_CGROUP_CPUSET. Only used when `vm_cgroup_parent` is set.
+    pub vm_cgroup_cpuset: Option<String>,
     /// Warm-pool policy (loaded from the optional config file + env).
     pub warm_pool: WarmPoolConfig,
     /// How long a create() waits for a VM slot (warm backfill or a freed cold
@@ -674,6 +684,10 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let vm_cgroup_pids_max = env_positive_u64("TARIT_VM_CGROUP_PIDS_MAX", 1024)?;
+        let vm_cgroup_cpuset = env::var("TARIT_VM_CGROUP_CPUSET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let warm_pool = load_warm_pool(file_config.as_ref())?;
 
@@ -782,6 +796,7 @@ impl Config {
             api_max_body_bytes,
             vm_cgroup_parent,
             vm_cgroup_pids_max,
+            vm_cgroup_cpuset,
             warm_pool,
             admission_timeout_ms,
             reap_on_shutdown,
@@ -837,6 +852,7 @@ impl fmt::Debug for Config {
             .field("api_max_body_bytes", &self.api_max_body_bytes)
             .field("vm_cgroup_parent", &self.vm_cgroup_parent)
             .field("vm_cgroup_pids_max", &self.vm_cgroup_pids_max)
+            .field("vm_cgroup_cpuset", &self.vm_cgroup_cpuset)
             .field("warm_pool", &self.warm_pool)
             .field("admission_timeout_ms", &self.admission_timeout_ms)
             .field("reap_on_shutdown", &self.reap_on_shutdown)

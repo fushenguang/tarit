@@ -817,6 +817,7 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_cgroup_cpuset: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
