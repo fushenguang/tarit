@@ -15,7 +15,17 @@ pub const MAX_QUEUE_SIZE: u16 = 256;
 
 /// Maximum per-descriptor length (1 MiB). Descriptors exceeding this are
 /// rejected to prevent guest-driven OOM allocation attacks.
-const MAX_DESC_LEN: u32 = 1024 * 1024;
+///
+/// This is also the value virtio-blk's transport (`blk_transport.rs`)
+/// advertises to the guest as `size_max` via `VIRTIO_BLK_F_SIZE_MAX`, so a
+/// spec-compliant guest never constructs a segment that lands here in the
+/// first place. Before that feature bit was advertised, a guest with no
+/// negotiated segment-size limit (the Linux default is 1.25 MiB) would
+/// routinely submit segments over this cap; `reject_available_chain` avoids
+/// hanging the guest on that (fushenguang/tarit#13), but a rejected write is
+/// still a *silently lost* write from the guest's perspective — the real
+/// fix is making sure a compliant guest never sends one (fushenguang/tarit#21).
+pub const MAX_DESC_LEN: u32 = 1024 * 1024;
 
 /// Maximum total bytes across all descriptors in a single chain (4 MiB).
 const MAX_CHAIN_BYTES: usize = 4 * 1024 * 1024;

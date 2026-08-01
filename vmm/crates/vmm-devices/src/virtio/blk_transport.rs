@@ -12,7 +12,8 @@ use crate::virtio::blk::{req_type, status, BlkReqHeader};
 use crate::virtio::blk_backend::BlkBackend;
 use crate::virtio::regs::{reg, MAGIC};
 use crate::virtio::vqueue::{
-    is_valid_queue_size, QueueConfig, VirtQueueProcessor, VirtQueueProcessorState, MAX_QUEUE_SIZE,
+    is_valid_queue_size, QueueConfig, VirtQueueProcessor, VirtQueueProcessorState, MAX_DESC_LEN,
+    MAX_QUEUE_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -24,13 +25,33 @@ use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 /// VIRTIO_F_VERSION_1 (bit 32) is required for virtio-mmio v2 devices.
 /// VIRTIO_BLK_F_FLUSH (bit 9) enables flush support.
 ///
+/// VIRTIO_BLK_F_SIZE_MAX (bit 1) and VIRTIO_BLK_F_SEG_MAX (bit 2) advertise
+/// `size_max`/`seg_max` in the config space (see `mmio_read`'s CONFIG arm).
+/// Without these, a guest has no negotiated segment-size limit and falls
+/// back to its own default (Linux: 1.25 MiB) — larger than the 1 MiB
+/// `MAX_DESC_LEN` the vqueue backend actually enforces. Every oversized
+/// segment a guest submitted under those defaults got silently dropped by
+/// `reject_available_chain` (no I/O error surfaced, no data written), which
+/// is exactly what corrupted a guest's ext4 root under a burst write
+/// workload (an ordinary `apt install` of a dev toolchain) in
+/// fushenguang/tarit#21. Advertising real limits stops a compliant guest
+/// from ever constructing a segment that lands in that path.
+///
 /// We deliberately do NOT advertise VIRTIO_RING_F_EVENT_IDX (bit 29): our
 /// virtqueue processor uses simple avail/used-index notification and does not
 /// implement the used_event/avail_event suppression that EVENT_IDX requires.
 /// Advertising it made the guest complete exactly one request and then stall,
 /// because its notification bookkeeping diverged from ours.
-const BLK_FEATURES_LOW: u32 = 1 << 9; // FLUSH
+const BLK_FEATURES_LOW: u32 = (1 << 1) | (1 << 2) | (1 << 9); // SIZE_MAX | SEG_MAX | FLUSH
 const BLK_FEATURES_HIGH: u32 = 1; // bit 32 = VIRTIO_F_VERSION_1
+
+/// Max number of data segments (readable + writable descriptors, excluding
+/// the request header and status byte) accepted in a single request.
+/// Comfortably under `MAX_QUEUE_SIZE - 2` (the queue-size-based chain-length
+/// cap `walk_descriptor_chain` already enforces, minus the header and status
+/// descriptors every request also needs), and bytes-per-chain is still
+/// independently capped by `MAX_CHAIN_BYTES` regardless of segment count.
+const BLK_SEG_MAX: u32 = 128;
 
 /// virtio interrupt status bits.
 const VIRTIO_MMIO_INT_VRING: u32 = 0x01;
@@ -649,21 +670,24 @@ impl MmioDevice for VirtioBlkMmio {
             reg::STATUS => self.status.load(Ordering::Relaxed),
             reg::INTERRUPT_STATUS => self.interrupt_status.load(Ordering::SeqCst),
             reg::CONFIG_GENERATION => 0,
-            // Device-specific config space (offset 0x100+).
-            // virtio-blk config: u64 capacity (sectors) at offset 0,
-            // u32 blk_size at offset 8 (optional).
+            // Device-specific config space (offset 0x100+), per virtio 1.x
+            // §5.2.4: u64 capacity (sectors) at offset 0, u32 size_max at
+            // offset 8 (VIRTIO_BLK_F_SIZE_MAX), u32 seg_max at offset 12
+            // (VIRTIO_BLK_F_SEG_MAX). Both feature bits are advertised above
+            // (BLK_FEATURES_LOW), so a guest is expected to read these.
             off if off >= reg::CONFIG => {
                 let cfg_off = (off - reg::CONFIG) as usize;
                 let backend = self.backend.lock().unwrap();
                 match &*backend {
                     Some(b) => {
                         let cap_bytes = b.sectors.to_le_bytes();
-                        let blk_size: u32 = 512;
-                        let size_bytes = blk_size.to_le_bytes();
-                        // Build the config space: [capacity u64][blk_size u32]
-                        let mut cfg = [0u8; 12];
+                        let size_max_bytes = MAX_DESC_LEN.to_le_bytes();
+                        let seg_max_bytes = BLK_SEG_MAX.to_le_bytes();
+                        // Build the config space: [capacity u64][size_max u32][seg_max u32]
+                        let mut cfg = [0u8; 16];
                         cfg[..8].copy_from_slice(&cap_bytes);
-                        cfg[8..12].copy_from_slice(&size_bytes);
+                        cfg[8..12].copy_from_slice(&size_max_bytes);
+                        cfg[12..16].copy_from_slice(&seg_max_bytes);
                         // Return the requested 4-byte window.
                         let end = (cfg_off + 4).min(cfg.len());
                         if cfg_off < end {
@@ -1026,6 +1050,40 @@ mod tests {
     fn magic_reads_back_as_virt() {
         let dev = VirtioBlkMmio::new_stub(5, 2);
         assert_eq!(dev.mmio_read(reg::MAGIC_VALUE, 4).unwrap(), MAGIC as u64);
+    }
+
+    #[test]
+    fn advertises_size_max_and_seg_max_features() {
+        let dev = VirtioBlkMmio::new_stub(5, 2);
+        dev.mmio_write(reg::HOST_FEATURES_SEL, 0, 4).unwrap();
+        let features_low = dev.mmio_read(reg::HOST_FEATURES, 4).unwrap() as u32;
+        assert_ne!(
+            features_low & (1 << 1),
+            0,
+            "VIRTIO_BLK_F_SIZE_MAX must be advertised"
+        );
+        assert_ne!(
+            features_low & (1 << 2),
+            0,
+            "VIRTIO_BLK_F_SEG_MAX must be advertised"
+        );
+    }
+
+    #[test]
+    fn config_space_exposes_size_max_and_seg_max() {
+        let (backend, path) = new_test_backend("blk-config-size-max");
+        let dev = VirtioBlkMmio::new(5, backend);
+        assert_eq!(
+            dev.mmio_read(reg::CONFIG + 8, 4).unwrap() as u32,
+            MAX_DESC_LEN,
+            "size_max at config offset 8 must match the vqueue backend's per-descriptor cap"
+        );
+        assert_eq!(
+            dev.mmio_read(reg::CONFIG + 12, 4).unwrap() as u32,
+            BLK_SEG_MAX,
+            "seg_max at config offset 12 must match what walk_descriptor_chain accepts"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
