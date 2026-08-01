@@ -233,6 +233,27 @@ fn ensure_cgroup2_dir(path: &Path) -> Result<(), CgroupError> {
     Ok(())
 }
 
+/// Enable `limits`' required controllers in every ancestor of `path`, from
+/// the cgroup v2 mount root down to `path`'s immediate parent.
+///
+/// A controller only shows up in a cgroup's own `cgroup.controllers` (i.e.
+/// becomes "available" there) once its *parent* has enabled it in the
+/// parent's `cgroup.subtree_control`. Enabling only the immediate parent —
+/// what this function used to do — silently no-ops whenever a *higher*
+/// ancestor (e.g. a systemd service's own delegated cgroup, sitting between
+/// the mount root and the per-VM parent dir) never enabled that controller
+/// itself: the immediate parent's `cgroup.controllers` stays empty no matter
+/// what gets written to its `cgroup.subtree_control`, and `apply_limits`
+/// fails with "controller is not available" even though the top-level mount
+/// root has always had it. Observed in production: `taritd.service`'s own
+/// cgroup (delegated via systemd `Delegate=yes`) has `cpu`/`cpuset`/etc.
+/// available but had never enabled them for its own children, so every
+/// per-VM cgroup two levels down (`taritd.service/vms/<id>`) failed this
+/// check on every restart until something manually re-primed
+/// `taritd.service`'s `cgroup.subtree_control` — a step nothing repeated
+/// automatically, so it silently regressed on the very next service
+/// restart. Walking the whole chain top-down makes that priming permanent
+/// and restart-safe, however many delegated levels sit in between.
 fn enable_parent_controllers(path: &Path, limits: &CgroupLimits) -> Result<(), CgroupError> {
     let required = required_controllers(limits);
     if required.is_empty() {
@@ -247,38 +268,60 @@ fn enable_parent_controllers(path: &Path, limits: &CgroupLimits) -> Result<(), C
     })?;
     ensure_cgroup2_dir(parent)?;
 
-    let available = read_word_set(parent.join("cgroup.controllers"))?;
-    let enabled = read_word_set(parent.join("cgroup.subtree_control"))?;
-    for controller in required {
-        if !available.contains(controller) {
-            return Err(CgroupError::Path(format!(
-                "cgroup v2 controller '{controller}' is not available in \
-                 {}/cgroup.controllers (available: {}). Enable/delegate it from \
-                 the parent subtree before launching the VMM.",
-                parent.display(),
-                format_word_set(&available)
-            )));
-        }
-        if !enabled.contains(controller) {
-            let subtree_control = parent.join("cgroup.subtree_control");
-            let value = format!("+{controller}");
-            fs::write(&subtree_control, value.as_bytes()).map_err(|e| {
-                CgroupError::Path(format!(
-                    "failed to enable cgroup v2 controller '{controller}' for child {} \
-                     by writing '+{controller}' to {}: {e}. Ensure the parent \
-                     cgroup is delegated/writable and contains no processes when \
-                     enabling domain controllers.",
-                    path.display(),
+    for level in ancestor_chain_from_cgroup_root(parent) {
+        ensure_cgroup2_dir(&level)?;
+        let available = read_word_set(level.join("cgroup.controllers"))?;
+        let enabled = read_word_set(level.join("cgroup.subtree_control"))?;
+        for controller in &required {
+            if !available.contains(*controller) {
+                return Err(CgroupError::Path(format!(
+                    "cgroup v2 controller '{controller}' is not available in \
+                     {}/cgroup.controllers (available: {}). Enable/delegate it from \
+                     the parent subtree before launching the VMM.",
+                    level.display(),
+                    format_word_set(&available)
+                )));
+            }
+            if !enabled.contains(*controller) {
+                let subtree_control = level.join("cgroup.subtree_control");
+                let value = format!("+{controller}");
+                fs::write(&subtree_control, value.as_bytes()).map_err(|e| {
+                    CgroupError::Path(format!(
+                        "failed to enable cgroup v2 controller '{controller}' for child {} \
+                         by writing '+{controller}' to {}: {e}. Ensure this cgroup \
+                         is delegated/writable and contains no processes when \
+                         enabling domain controllers.",
+                        path.display(),
+                        subtree_control.display()
+                    ))
+                })?;
+                log::info!(
+                    "cgroup: enabled controller {controller} in {}",
                     subtree_control.display()
-                ))
-            })?;
-            log::info!(
-                "cgroup: enabled controller {controller} in {}",
-                subtree_control.display()
-            );
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Return `dir` and every cgroup v2 ancestor of it, ordered from the
+/// mount-root-most ancestor down to `dir` itself (top-down, matching the
+/// order controllers must be enabled in for delegation to propagate).
+/// Stops climbing at the first ancestor whose own parent is no longer a
+/// cgroup v2 directory (i.e. `dir`'s controlling mount root).
+fn ancestor_chain_from_cgroup_root(dir: &Path) -> Vec<PathBuf> {
+    let mut chain = vec![dir.to_path_buf()];
+    let mut cur = dir.to_path_buf();
+    while let Some(parent) = cur.parent() {
+        if !parent.join("cgroup.controllers").exists() {
+            break;
+        }
+        chain.push(parent.to_path_buf());
+        cur = parent.to_path_buf();
+    }
+    chain.reverse();
+    chain
 }
 
 fn read_word_set(path: PathBuf) -> Result<BTreeSet<String>, CgroupError> {
@@ -319,6 +362,137 @@ fn controller_for_key(key: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch directory unique to this test process + test name, cleaned
+    /// up on drop. Standing in for a cgroup v2 tree: `cgroup.controllers` /
+    /// `cgroup.subtree_control` / `cgroup.procs` are plain files here (the
+    /// functions under test only ever read/write them as such — real kernel
+    /// enforcement of what a child's `cgroup.controllers` reflects isn't
+    /// something a plain directory can simulate, so these tests check what
+    /// this module actually controls: which levels it visits, in what
+    /// order, and what it writes/errors on at each one).
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "vmm-jailer-cgroup-test-{name}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Seed `dir` as a fake cgroup v2 directory with the given `controllers`
+    /// (space-separated) available and `subtree_control` already enabled.
+    fn seed_cgroup_dir(dir: &Path, controllers: &str, subtree_control: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("cgroup.controllers"), controllers).unwrap();
+        fs::write(dir.join("cgroup.subtree_control"), subtree_control).unwrap();
+        fs::write(dir.join("cgroup.procs"), "").unwrap();
+    }
+
+    #[test]
+    fn ancestor_chain_walks_root_to_leaf_and_stops_at_the_mount_boundary() {
+        let scratch = ScratchDir::new("ancestor-chain");
+        // scratch.path() itself is NOT a cgroup dir (no cgroup.controllers),
+        // so it marks the mount boundary the walk must stop at.
+        let root = scratch.path().join("root");
+        let level1 = root.join("level1");
+        let level2 = level1.join("level2");
+        for d in [&root, &level1, &level2] {
+            seed_cgroup_dir(d, "cpu cpuset memory pids", "");
+        }
+
+        let chain = ancestor_chain_from_cgroup_root(&level2);
+        assert_eq!(chain, vec![root, level1, level2]);
+    }
+
+    #[test]
+    fn enable_parent_controllers_enables_every_level_top_down() {
+        let scratch = ScratchDir::new("enable-multi-level");
+        // Simulates taritd.service (root, "cpu" available but never
+        // enabled for its children) -> vms (child, also has "cpu"
+        // available for this test's purposes) -> the per-VM leaf whose
+        // *parent* (vms) is what enable_parent_controllers is asked about.
+        let root = scratch.path().join("taritd.service");
+        let vms = root.join("vms");
+        seed_cgroup_dir(&root, "cpu cpuset memory pids", "");
+        seed_cgroup_dir(&vms, "cpu cpuset memory pids", "");
+        let leaf = vms.join("vm-123"); // never created on disk; only used for .parent()
+
+        let limits = CgroupLimits {
+            cpu_weight: Some(100),
+            ..Default::default()
+        };
+        enable_parent_controllers(&leaf, &limits).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(),
+            "+cpu",
+            "the higher ancestor (taritd.service) must get enabled, not just the immediate parent"
+        );
+        assert_eq!(
+            fs::read_to_string(vms.join("cgroup.subtree_control")).unwrap(),
+            "+cpu"
+        );
+    }
+
+    #[test]
+    fn enable_parent_controllers_skips_writing_when_already_enabled() {
+        let scratch = ScratchDir::new("enable-already-on");
+        let root = scratch.path().join("root");
+        let vms = root.join("vms");
+        seed_cgroup_dir(&root, "cpu", "cpu"); // already enabled
+        seed_cgroup_dir(&vms, "cpu", "cpu"); // already enabled
+        let leaf = vms.join("vm-123");
+
+        let limits = CgroupLimits {
+            cpu_weight: Some(100),
+            ..Default::default()
+        };
+        enable_parent_controllers(&leaf, &limits).unwrap();
+
+        // Untouched: still exactly what we seeded, no "+cpu" appended again.
+        assert_eq!(fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(), "cpu");
+        assert_eq!(fs::read_to_string(vms.join("cgroup.subtree_control")).unwrap(), "cpu");
+    }
+
+    #[test]
+    fn enable_parent_controllers_errors_when_a_higher_ancestor_never_had_the_controller() {
+        let scratch = ScratchDir::new("enable-missing-higher");
+        let root = scratch.path().join("root");
+        let vms = root.join("vms");
+        // root never had "cpu" delegated to it at all -- the exact bug this
+        // fix targets: the immediate parent (vms) looking fine in isolation
+        // doesn't matter if a level above it is the real blocker.
+        seed_cgroup_dir(&root, "memory pids", "");
+        seed_cgroup_dir(&vms, "cpu memory pids", "");
+        let leaf = vms.join("vm-123");
+
+        let limits = CgroupLimits {
+            cpu_weight: Some(100),
+            ..Default::default()
+        };
+        let err = enable_parent_controllers(&leaf, &limits).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(root.to_str().unwrap()),
+            "error should name the actual blocking ancestor (root), got: {msg}"
+        );
+    }
 
     #[test]
     fn default_is_all_none() {
