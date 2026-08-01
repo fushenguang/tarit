@@ -466,8 +466,14 @@ mod tests {
         enable_parent_controllers(&leaf, &limits).unwrap();
 
         // Untouched: still exactly what we seeded, no "+cpu" appended again.
-        assert_eq!(fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(), "cpu");
-        assert_eq!(fs::read_to_string(vms.join("cgroup.subtree_control")).unwrap(), "cpu");
+        assert_eq!(
+            fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(),
+            "cpu"
+        );
+        assert_eq!(
+            fs::read_to_string(vms.join("cgroup.subtree_control")).unwrap(),
+            "cpu"
+        );
     }
 
     #[test]
