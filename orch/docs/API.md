@@ -76,9 +76,31 @@ status. It is not the stored record returned by `GET /v1/vms/{id}`.
   "uptime_ms": 1037,
   "vcpus": 1,
   "mem_mib": 256,
-  "vcpu_alive": true
+  "vcpu_alive": true,
+  "blk_io_errors": 0,
+  "storage_healthy": true
 }
 ```
+
+`vcpu_alive` and `storage_healthy` answer different questions and must both be
+checked. `vcpu_alive` is true while a vCPU thread exists and has not exited;
+`storage_healthy` is false once the VMM has observed any backing-store I/O
+failure for this VM (`blk_io_errors > 0`).
+
+A VM can be `"state": "running"` with `vcpu_alive: true` and still be completely
+unusable: if its disk goes away, the guest kernel takes I/O errors, aborts its
+journal and remounts its filesystem read-only, while its vCPUs keep executing
+perfectly happily. That is not hypothetical — it is what happened on 2026-08-04
+(fushenguang/tarit#28), and for twelve minutes nothing in this response
+distinguished that VM from a healthy one.
+
+`blk_io_errors` is sticky: it does not return to zero if later requests succeed.
+By the time a guest filesystem has remounted itself read-only the damage is
+done. Treat any non-zero value as "this VM needs attention", not as a live gauge
+of current disk health.
+
+A `vmm` predating this counter omits `blk_io_errors`; it is then reported as `0`
+and `storage_healthy` as `true`. Absence means "not observed", not "failed".
 
 ### `ExecutionRecord`
 
@@ -333,8 +355,12 @@ Resolve owner through the fleet registry and query the owning VMM over its Unix 
 Response `200`: `LiveVmStatus`.
 
 This differs from `GET /v1/vms/{id}`: `/status` reports sanitized live state,
-uptime, shape, and `vcpu_alive`; it does not expose the VMM's kernel path or
-device configuration.
+uptime, shape, `vcpu_alive`, and `storage_healthy`; it does not expose the VMM's
+kernel path or device configuration.
+
+This is the only endpoint that queries the VMM live. `GET /v1/vms/{id}` returns
+the stored record, which cannot tell you whether a VM's storage is still there —
+poll this one if you need that.
 
 Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`, `503`.
 

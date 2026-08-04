@@ -227,6 +227,7 @@ mod tests {
             nets: 1,
             kernel: "/vmlinux".into(),
             vcpu_alive: true,
+            blk_io_errors: 0,
         };
         let r = ApiResponse::Status(st.clone());
         let s = serde_json::to_string(&r).unwrap();

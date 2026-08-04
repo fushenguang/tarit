@@ -2475,6 +2475,7 @@ mod tests {
                         nets: 0,
                         kernel: "kernel".into(),
                         vcpu_alive: true,
+                        blk_io_errors: 0,
                     })
                 }
                 tarit_vmm_client::ApiRequest::Exec { .. } => tarit_vmm_client::ApiResponse::Exec {
@@ -2571,6 +2572,7 @@ mod tests {
                         nets: 0,
                         kernel: "kernel".into(),
                         vcpu_alive: true,
+                        blk_io_errors: 0,
                     })
                 }
                 _ => tarit_vmm_client::ApiResponse::Ok,
@@ -2668,6 +2670,7 @@ mod tests {
                                 nets: 0,
                                 kernel: "kernel".into(),
                                 vcpu_alive: true,
+                                blk_io_errors: 0,
                             })
                         }
                     }

@@ -4832,6 +4832,7 @@ mod tests {
                 nets: 0,
                 kernel: "kernel".into(),
                 vcpu_alive: true,
+                blk_io_errors: 0,
             });
             let encoded = serde_json::to_vec(&response).unwrap();
             stream
