@@ -10,6 +10,8 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::virtio::blk::{req_type, status, validate_req, BlkReqHeader};
@@ -412,6 +414,20 @@ pub struct BlkBackend {
     storage: BackendStorage,
     pub read_only: bool,
     pub sectors: u64,
+    /// Backing-store I/O failures observed since this backend was opened.
+    ///
+    /// Telling the guest about a failed request (`status::IO_ERR`) is not
+    /// enough on its own: the guest reacts by aborting its journal and going
+    /// read-only, but the host sees nothing except a log line and keeps
+    /// reporting the VM as running. This counter is the host-pollable
+    /// signal — see `io_error_count`.
+    ///
+    /// Shared and atomic on purpose: the backend is serviced from the device
+    /// thread, while whoever answers a status query runs elsewhere. A plain
+    /// `u64` behind `&mut self` could only be read by stopping the VM, which
+    /// defeats the point of a health signal. Clone a reader out with
+    /// [`Self::io_error_handle`].
+    io_errors: Arc<AtomicU64>,
 }
 
 impl BlkBackend {
@@ -436,6 +452,7 @@ impl BlkBackend {
             storage: BackendStorage::Raw(file),
             read_only,
             sectors,
+            io_errors: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -467,6 +484,7 @@ impl BlkBackend {
             storage: BackendStorage::Cow(cow),
             read_only: false,
             sectors,
+            io_errors: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -490,25 +508,28 @@ impl BlkBackend {
             req_type::IN => {
                 if let Err(e) = self.read_at(offset, data) {
                     log::warn!("blk: read failed: {e}");
-                    return status::IO_ERR;
+                    return self.record_io_error();
                 }
                 status::OK
             }
             req_type::OUT => {
                 if self.read_only {
+                    // Not a backing-store failure: the device was configured
+                    // read-only and the guest asked for something it was never
+                    // going to get. Deliberately not counted.
                     log::warn!("blk: write to read-only device");
                     return status::IO_ERR;
                 }
                 if let Err(e) = self.write_at(offset, data, force_unit_access) {
                     log::warn!("blk: write failed: {e}");
-                    return status::IO_ERR;
+                    return self.record_io_error();
                 }
                 status::OK
             }
             req_type::FLUSH => {
                 if let Err(e) = self.flush() {
                     log::warn!("blk: flush failed: {e}");
-                    return status::IO_ERR;
+                    return self.record_io_error();
                 }
                 status::OK
             }
@@ -524,6 +545,38 @@ impl BlkBackend {
                 status::UNSUPP
             }
         }
+    }
+
+    /// Count one backing-store I/O failure and return the guest status byte.
+    ///
+    /// Saturating rather than wrapping: a counter that rolls over to 0 would
+    /// read as "healthy" to anything polling it, which is precisely the
+    /// failure mode this counter exists to prevent.
+    fn record_io_error(&mut self) -> u8 {
+        self.io_errors.fetch_add(1, Ordering::Relaxed);
+        status::IO_ERR
+    }
+
+    /// Clone a reader for this device's I/O error counter.
+    ///
+    /// Hand this to whatever answers status queries so it can observe a dying
+    /// backing store without touching the device thread.
+    #[must_use]
+    pub fn io_error_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.io_errors)
+    }
+
+    /// Backing-store I/O failures observed since this backend was opened.
+    ///
+    /// Non-zero means the disk under this device has been rejecting requests.
+    /// It never resets: by the time a guest filesystem has reacted to an I/O
+    /// error by remounting itself read-only, the damage is done and later
+    /// requests succeeding again does not undo it. An orchestrator polling
+    /// this must treat any non-zero value as "this VM needs attention", not
+    /// as a live gauge of current disk health.
+    #[must_use]
+    pub fn io_error_count(&self) -> u64 {
+        self.io_errors.load(Ordering::Relaxed)
     }
 
     /// Get the raw fd (for epoll-based I/O).
@@ -845,6 +898,49 @@ mod tests {
         let mut data = vec![0xCC; 512];
         let status = backend.service(&header, &mut data);
         assert_eq!(status, status::IO_ERR);
+    }
+
+    /// Regression test for the 2026-08-04 production incident (tarit#28).
+    ///
+    /// The PV underneath the overlay's filesystem dropped off the USB bus and
+    /// re-enumerated. Every guest write started failing with EIO, the guest's
+    /// ext4 aborted its journal and remounted read-only, and the VM became
+    /// unusable — while the VMM process stayed perfectly healthy and taritd
+    /// went on reporting `status: running` for twelve minutes.
+    ///
+    /// The backend already tells the *guest* (status::IO_ERR). What it does not
+    /// do is leave any trace the *host* can poll: the only record was a
+    /// `log::warn!` line. An orchestrator cannot act on a log line.
+    ///
+    /// Opening the backing file read-only and then presenting the device as
+    /// writable makes pwrite(2) fail deterministically, which reproduces the
+    /// shape of the failure without needing a real dying disk.
+    #[test]
+    fn service_counts_backing_store_write_failures_for_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failing.blk");
+        std::fs::write(&path, vec![0u8; SECTOR_SIZE_USIZE]).unwrap();
+
+        let mut backend = BlkBackend::open(&path, true).unwrap();
+        assert_eq!(
+            backend.io_error_count(),
+            0,
+            "a freshly opened backend has taken no I/O errors"
+        );
+        backend.read_only = false;
+
+        let mut data = vec![0xAAu8; SECTOR_SIZE_USIZE];
+        let status = backend.service(&hdr(req_type::OUT, 0), &mut data);
+
+        // This half already works today.
+        assert_eq!(status, status::IO_ERR, "the guest must see the failure");
+
+        // This half is the defect: the host has no way to observe it.
+        assert_eq!(
+            backend.io_error_count(),
+            1,
+            "the backend must count I/O failures so the orchestrator can observe them"
+        );
     }
 
     #[test]
