@@ -1287,6 +1287,24 @@ impl VmmController {
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
         let vcpu_alive = false;
 
+        // Summed rather than per-device: the orchestrator's question is "is this
+        // VM's storage healthy", and any one failing volume is enough to make
+        // the answer no. Lock free, so this stays a cheap health probe even
+        // while the device thread is stuck on the very I/O that is failing.
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        let blk_io_errors = vm
+            .running
+            .as_ref()
+            .map(|r| {
+                r.blk_devices
+                    .iter()
+                    .map(|d| d.io_error_count())
+                    .fold(0u64, u64::saturating_add)
+            })
+            .unwrap_or(0);
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let blk_io_errors = 0;
+
         Ok(crate::state::VmStatus {
             state: vm.state,
             uptime_ms: vm.created_at.elapsed().as_millis() as u64,
@@ -1296,6 +1314,7 @@ impl VmmController {
             nets: vm.config.net.len(),
             kernel: vm.config.kernel.path.clone(),
             vcpu_alive,
+            blk_io_errors,
         })
     }
 

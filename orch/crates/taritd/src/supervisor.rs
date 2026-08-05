@@ -1349,6 +1349,21 @@ impl VmmSupervisor {
             "--cgroup-memory-max".to_string(),
             format!("{max_mib}M"),
         ];
+        // memory.high = 90% of memory.max, floored, so the kernel gets ~10%
+        // headroom to reclaim in the background before a VM's vCPU thread
+        // hits the memory.max wall and has to reclaim synchronously (all
+        // direct reclaim, no kswapd, per real cgroup stats from tarit#28).
+        // Not a fix for #28 itself (that was a disconnected USB backing
+        // store) — an independent latency-source gap, possibly related to
+        // the in-guest RCU stall / vCPU livelock tracked in tarit#26. 90%
+        // is a deliberately unremarkable choice: enough margin that soft
+        // reclaim has room to work, not tuned further because there's no
+        // signal yet that it needs to be. Not made configurable to keep
+        // this change's surface area small.
+        if let Some(high_mib) = memory_high_mib(max_mib) {
+            args.push("--cgroup-memory-high".to_string());
+            args.push(format!("{high_mib}M"));
+        }
         if let Some(cpuset) = self.config.vm_cgroup_cpuset.as_ref() {
             args.push("--cpuset".to_string());
             args.push(cpuset.clone());
@@ -4055,6 +4070,20 @@ impl VmmSupervisor {
     }
 }
 
+/// memory.high in MiB for a given memory.max in MiB: 90% of max, floored.
+/// Returns `None` when that comes out to 0 (a max too small to leave any
+/// headroom under), in which case the caller should simply not set
+/// memory.high at all rather than pass `0` (which would mean "throttle
+/// immediately", the opposite of the intent).
+///
+/// `max_mib` is widened to u128 for the multiply so this can't overflow for
+/// any real cgroup memory size; it's here purely as a unit-testable seam,
+/// not because `cgroup_args`'s inputs can plausibly hit u64::MAX / 9.
+fn memory_high_mib(max_mib: u64) -> Option<u64> {
+    let high = (u128::from(max_mib) * 9 / 10) as u64;
+    (high > 0).then_some(high)
+}
+
 fn wait_for_booting_tasks(
     controls: impl IntoIterator<Item = Arc<BootControl>>,
 ) -> Vec<Result<(), OrchError>> {
@@ -4832,6 +4861,7 @@ mod tests {
                 nets: 0,
                 kernel: "kernel".into(),
                 vcpu_alive: true,
+                blk_io_errors: 0,
             });
             let encoded = serde_json::to_vec(&response).unwrap();
             stream
@@ -5286,10 +5316,10 @@ mod tests {
         config.vm_cgroup_parent = Some("/sys/fs/cgroup/tarit".into());
         let supervisor = VmmSupervisor::new(config);
         let id = Uuid::new_v4();
-        for (vcpus, memory_mib, cpu, memory) in [
-            (1, 256, "1000m", "640M"),
-            (2, 512, "2000m", "1024M"),
-            (8, 4096, "8000m", "6400M"),
+        for (vcpus, memory_mib, cpu, memory, memory_high) in [
+            (1, 256, "1000m", "640M", "576M"),
+            (2, 512, "2000m", "1024M", "921M"),
+            (8, 4096, "8000m", "6400M", "5760M"),
         ] {
             let args = supervisor
                 .cgroup_args(id, ResourceShape::new(vcpus, memory_mib))
@@ -5303,13 +5333,40 @@ mod tests {
                 .iter()
                 .position(|arg| arg == "--cgroup-memory-max")
                 .unwrap();
+            let memory_high_index = args
+                .iter()
+                .position(|arg| arg == "--cgroup-memory-high")
+                .unwrap();
             assert_eq!(
                 args[path_index + 1],
                 format!("/sys/fs/cgroup/tarit/tarit-{id}")
             );
             assert_eq!(args[cpu_index + 1], cpu);
             assert_eq!(args[memory_index + 1], memory);
+            assert_eq!(args[memory_high_index + 1], memory_high);
         }
+    }
+
+    #[test]
+    fn cgroup_memory_high_helper_is_ninety_percent_of_max_rounded_down() {
+        // memory.high = 90% of memory.max, floored. ~10% headroom lets the
+        // kernel apply soft memory pressure (background reclaim) before a
+        // VM's vCPU thread hits the memory.max wall and has to reclaim
+        // synchronously (tarit#28 follow-up; see cgroup_args doc comment).
+        assert_eq!(memory_high_mib(640), Some(576));
+        assert_eq!(memory_high_mib(1024), Some(921));
+        assert_eq!(memory_high_mib(6400), Some(5760));
+    }
+
+    #[test]
+    fn cgroup_memory_high_helper_omits_when_max_too_small_to_leave_headroom() {
+        // memory_mib=0 is not a real reservation, but max_mib can never
+        // actually be 0 in cgroup_args (there's always +256 MiB overhead),
+        // so this only exercises the helper's own floor at its boundary.
+        assert_eq!(memory_high_mib(0), None);
+        assert_eq!(memory_high_mib(1), None);
+        // 10 * 9 / 10 == 9, still meaningfully > 0.
+        assert_eq!(memory_high_mib(10), Some(9));
     }
 
     #[test]

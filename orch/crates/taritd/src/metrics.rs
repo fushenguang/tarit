@@ -78,6 +78,16 @@ pub struct Metrics {
     exec_total: AtomicU64,
     store_enqueue_failures_total: AtomicU64,
     store_write_failures_total: AtomicU64,
+    /// Sticky latch: set once SQLite reports content-level corruption
+    /// (SQLITE_CORRUPT / SQLITE_NOTADB) and never cleared for the rest of
+    /// the process's lifetime — corruption does not self-heal, so a later
+    /// write happening to succeed must not be read as "recovered".
+    store_corrupted: AtomicBool,
+    /// Writes short-circuited (never touched SQLite) after the latch above
+    /// tripped. Counted instead of logged per-write so the operator sees one
+    /// loud error plus a growing number here, not a repeat of the tarit#28
+    /// 12-minute per-write ERROR spam.
+    store_write_suppressed_total: AtomicU64,
     share_requests: [AtomicU64; SHARE_VISIBILITY_COUNT * SHARE_STATUS_CLASS_COUNT],
     share_auth_failures_total: AtomicU64,
     share_owner_failures_total: AtomicU64,
@@ -96,6 +106,8 @@ impl Default for Metrics {
             exec_total: AtomicU64::new(0),
             store_enqueue_failures_total: AtomicU64::new(0),
             store_write_failures_total: AtomicU64::new(0),
+            store_corrupted: AtomicBool::new(false),
+            store_write_suppressed_total: AtomicU64::new(0),
             share_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             share_auth_failures_total: AtomicU64::new(0),
             share_owner_failures_total: AtomicU64::new(0),
@@ -178,6 +190,24 @@ impl Metrics {
         increment_counter(&self.store_write_failures_total, 1);
     }
 
+    /// Trip the corruption latch. Returns `true` only the first time this
+    /// ever transitions false -> true, so the caller can log its loud,
+    /// one-time ERROR exactly once and stay silent on every call after.
+    /// Never resets: content-level corruption does not self-heal.
+    pub(crate) fn mark_store_corrupted(&self) -> bool {
+        self.store_corrupted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn is_store_corrupted(&self) -> bool {
+        self.store_corrupted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn inc_store_write_suppressed(&self) {
+        increment_counter(&self.store_write_suppressed_total, 1);
+    }
+
     pub(crate) fn track_share_http(self: &Arc<Self>) -> ActiveShareHttp {
         increment_counter(&self.active_share_http, 1);
         ActiveShareHttp {
@@ -217,6 +247,16 @@ impl Metrics {
     #[cfg(test)]
     pub(crate) fn active_share_websockets(&self) -> u64 {
         self.active_share_websockets.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_write_failures_total(&self) -> u64 {
+        self.store_write_failures_total.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_write_suppressed_total(&self) -> u64 {
+        self.store_write_suppressed_total.load(Ordering::Relaxed)
     }
 
     fn observe_share(&self, visibility: ShareMetricVisibility, status: ShareStatusClass) {
@@ -497,6 +537,33 @@ pub fn render_metrics(state: &AppState) -> String {
         out,
         "taritd_store_queue_available {}",
         state.store_tx.capacity()
+    );
+    metric_header(
+        &mut out,
+        "taritd_store_corrupted",
+        "gauge",
+        "1 once SQLite has reported content-level corruption (SQLITE_CORRUPT/SQLITE_NOTADB); \
+         sticky for the process lifetime. Writes are suspended while this is 1; see /readyz.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_store_corrupted {}",
+        state.metrics.is_store_corrupted() as u8
+    );
+    metric_header(
+        &mut out,
+        "taritd_store_write_suppressed_total",
+        "counter",
+        "Writes short-circuited without touching SQLite after content-level corruption was \
+         detected, instead of a per-write ERROR log line.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_store_write_suppressed_total {}",
+        state
+            .metrics
+            .store_write_suppressed_total
+            .load(Ordering::Relaxed)
     );
 
     let pty = state.pty_registry.connection_stats();
@@ -818,11 +885,18 @@ mod tests {
             "taritd_share_bytes_out_total",
             "taritd_share_active_http",
             "taritd_share_active_websockets",
+            "taritd_store_corrupted",
+            "taritd_store_write_suppressed_total",
         ] {
             assert!(body.contains(&format!("# HELP {metric} ")), "{metric} HELP");
             assert!(body.contains(&format!("# TYPE {metric} ")), "{metric} TYPE");
         }
 
+        assert!(
+            body.contains("taritd_store_corrupted 0\n"),
+            "an unlatched store must render as 0, not merely absent"
+        );
+        assert!(body.contains("taritd_store_write_suppressed_total 0\n"));
         assert!(body.contains("taritd_up 1\n"));
         assert!(body.contains("taritd_vms{status=\"running\"} 1\n"));
         // Tenant labels are hashed by default so metrics do not expose raw
@@ -946,6 +1020,48 @@ mod tests {
                 "share metric output leaked {secret_or_identifier}"
             );
         }
+    }
+
+    // tarit#28: the fail-fast fix hinges on this latch being sticky and
+    // tripping exactly once, so the taritd store_writer loop can log its
+    // loud ERROR a single time and silently count every write after.
+    #[test]
+    fn mark_store_corrupted_trips_once_and_is_sticky() {
+        let metrics = Metrics::default();
+        assert!(!metrics.is_store_corrupted());
+
+        assert!(
+            metrics.mark_store_corrupted(),
+            "the first trip must report true so the caller logs exactly once"
+        );
+        assert!(metrics.is_store_corrupted());
+
+        assert!(
+            !metrics.mark_store_corrupted(),
+            "a second trip must report false: no repeat loud logging"
+        );
+        assert!(
+            !metrics.mark_store_corrupted(),
+            "the latch must stay tripped no matter how many more writes fail"
+        );
+        assert!(
+            metrics.is_store_corrupted(),
+            "corruption never self-heals; the latch must never clear"
+        );
+    }
+
+    #[test]
+    fn store_write_suppressed_counter_renders_after_latch_trips() {
+        let state = test_state();
+        assert!(render_metrics(&state).contains("taritd_store_write_suppressed_total 0\n"));
+
+        state.metrics.mark_store_corrupted();
+        state.metrics.inc_store_write_suppressed();
+        state.metrics.inc_store_write_suppressed();
+
+        let rendered = render_metrics(&state);
+        assert!(rendered.contains("taritd_store_corrupted 1\n"));
+        assert!(rendered.contains("taritd_store_write_suppressed_total 2\n"));
     }
 
     fn test_state() -> AppState {

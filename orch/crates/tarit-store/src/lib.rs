@@ -70,6 +70,30 @@ pub enum StoreError {
     Conflict(String),
 }
 
+impl StoreError {
+    /// True only for SQLite errors that mean the database *content* is
+    /// unrecoverably corrupt: SQLITE_CORRUPT ("database disk image is
+    /// malformed") or SQLITE_NOTADB ("file is not a database"). Both are
+    /// classified structurally via `rusqlite::Error::SqliteFailure`'s
+    /// `ErrorCode`, never by matching the error's display text.
+    ///
+    /// Deliberately excludes SQLITE_IOERR ("disk I/O error") and every other
+    /// code: an I/O error can be transient (a flaky disk, a temporary
+    /// read-only remount) and does not imply the on-disk content is
+    /// corrupt. Callers that latch persistence off on corruption must not
+    /// trip that latch for a plain I/O error.
+    pub fn is_content_corruption(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    }
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -1393,6 +1417,79 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>, rusqlite::Error> {
 mod tests {
     use super::*;
     use tarit_types::{ShareRecord, ShareVisibility};
+
+    // tarit#28: a disk carrying fleet.db went offline, the filesystem went
+    // read-only, and the database ended up content-corrupt. taritd logged a
+    // per-write ERROR for 12 minutes and kept accepting work against an
+    // unrecoverably corrupt store. These tests pin down the classification
+    // that a fail-fast latch is built on: it must fire for content-level
+    // corruption and must never fire for a plain (potentially transient)
+    // disk I/O error.
+    #[test]
+    fn is_content_corruption_flags_database_corrupt_and_not_a_database() {
+        let corrupt = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("database disk image is malformed".into()),
+        ));
+        assert!(
+            corrupt.is_content_corruption(),
+            "SQLITE_CORRUPT must classify as content-level corruption"
+        );
+
+        let not_a_db = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            Some("file is not a database".into()),
+        ));
+        assert!(
+            not_a_db.is_content_corruption(),
+            "SQLITE_NOTADB must classify as content-level corruption"
+        );
+    }
+
+    #[test]
+    fn is_content_corruption_never_fires_for_io_error_or_other_store_errors() {
+        let io_error = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            Some("disk I/O error".into()),
+        ));
+        assert!(
+            !io_error.is_content_corruption(),
+            "SQLITE_IOERR can be transient and must never trip a corruption latch"
+        );
+
+        let busy = StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        ));
+        assert!(!busy.is_content_corruption());
+
+        assert!(!StoreError::NotFound.is_content_corruption());
+        assert!(!StoreError::Conflict("share slug already exists".into()).is_content_corruption());
+    }
+
+    #[test]
+    fn is_content_corruption_matches_a_genuinely_corrupted_database_file() {
+        // Exercise the real rusqlite error path (not a synthetic one): point
+        // Store::open at a file that is not a SQLite database at all, which
+        // is exactly what a truncated/overwritten fleet.db looks like after
+        // disk corruption.
+        let path =
+            std::env::temp_dir().join(format!("tarit-store-corrupt-test-{}.db", Uuid::new_v4()));
+        std::fs::write(&path, b"not a sqlite database; garbage header bytes")
+            .expect("write garbage file");
+
+        let result = Store::open(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let error = match result {
+            Err(e) => e,
+            Ok(_) => panic!("opening a non-sqlite file must fail"),
+        };
+        assert!(
+            error.is_content_corruption(),
+            "a real corrupted-header file must classify as content-level corruption, got: {error}"
+        );
+    }
 
     fn test_share(slug: &str, owner_key: &str) -> ShareRecord {
         let now = Utc::now();

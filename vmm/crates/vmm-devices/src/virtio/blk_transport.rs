@@ -178,11 +178,34 @@ pub struct VirtioBlkMmio {
     /// ACK → DRIVER → FEATURES_OK → DRIVER_OK). Reading STATUS shows the
     /// *current* bits; this shows the *number of transitions*.
     pub status_writes: AtomicU64,
+    /// Backing-store I/O failures, shared with the `BlkBackend` this transport
+    /// owns.
+    ///
+    /// Held as its own handle rather than read through `backend` so a status
+    /// query never takes that Mutex: the device thread holds it for the whole
+    /// duration of every request, and a health check must not be able to block
+    /// behind guest I/O — least of all when that I/O is the thing going wrong.
+    ///
+    /// This is the counter `notify_count`'s doc comment above already assumes
+    /// exists ("queue kicked but backend errored") but which, until now, had no
+    /// way to be observed.
+    blk_io_errors: std::sync::Arc<AtomicU64>,
 }
 
 impl VirtioBlkMmio {
     /// Create a new virtio-blk MMIO device with a file-backed backend.
+    /// Backing-store I/O failures this device has taken since it was created.
+    ///
+    /// Non-zero means the disk under this VM has been rejecting requests. Lock
+    /// free — safe to call from a health-check path at any time.
+    #[must_use]
+    pub fn io_error_count(&self) -> u64 {
+        self.blk_io_errors
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new(irq: u32, backend: BlkBackend) -> Self {
+        let blk_io_errors = backend.io_error_handle();
         Self {
             irq,
             device_id: 2,
@@ -206,6 +229,7 @@ impl VirtioBlkMmio {
             irq_evt: Mutex::new(None),
             notify_count: AtomicU64::new(0),
             status_writes: AtomicU64::new(0),
+            blk_io_errors,
         }
     }
 
@@ -234,6 +258,7 @@ impl VirtioBlkMmio {
             irq_evt: Mutex::new(None),
             notify_count: AtomicU64::new(0),
             status_writes: AtomicU64::new(0),
+            blk_io_errors: std::sync::Arc::new(AtomicU64::new(0)),
         }
     }
 

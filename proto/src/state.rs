@@ -33,6 +33,24 @@ pub struct VmStatus {
     /// True while a vCPU thread exists and has not exited (running or paused).
     /// False before boot, after stop, or after an abnormal guest death.
     pub vcpu_alive: bool,
+    /// Backing-store I/O failures summed across this VM's block devices.
+    ///
+    /// `vcpu_alive` answers "is the guest executing"; this answers "is its disk
+    /// still there". They are independent: on 2026-08-04 a VM ran with healthy
+    /// vCPUs for twelve minutes after its storage had gone, its filesystem
+    /// read-only and its workload dead, while the orchestrator saw nothing
+    /// wrong (fushenguang/tarit#28).
+    ///
+    /// Non-zero is sticky — it does not clear if later requests succeed. Once a
+    /// guest filesystem has reacted to an I/O error by remounting itself
+    /// read-only, the damage is done; treat any non-zero value as "this VM
+    /// needs attention", not as a live gauge of current disk health.
+    ///
+    /// `#[serde(default)]` so a newer orchestrator can still read a status
+    /// response from an older `vmm` that predates this field — the two are
+    /// separate binaries and are not necessarily replaced in the same instant.
+    #[serde(default)]
+    pub blk_io_errors: u64,
 }
 
 impl VmState {
