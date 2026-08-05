@@ -248,8 +248,7 @@ async fn run_server(
             c.insert(vm.id, vm.clone());
         }
     }
-    let (store_tx, mut store_rx) =
-        tokio::sync::mpsc::channel::<api::StoreWrite>(STORE_QUEUE_CAPACITY);
+    let (store_tx, store_rx) = tokio::sync::mpsc::channel::<api::StoreWrite>(STORE_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
     let shutdown = ShutdownCoordinator::new(shutdown_tx.clone(), Arc::clone(&supervisor));
 
@@ -336,57 +335,7 @@ async fn run_server(
         let store = Arc::clone(&state.store);
         let metrics = Arc::clone(&state.metrics);
         let shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            loop {
-                let op = tokio::select! {
-                    biased;
-                    _ = wait_for_shutdown(shutdown_rx.clone()) => break,
-                    op = store_rx.recv() => op,
-                };
-                let Some(op) = op else {
-                    break;
-                };
-                match store.lock() {
-                    Ok(s) => match op {
-                        api::StoreWrite::VmDurable(rec, completion) => {
-                            let result = s.insert_vm(&rec).map_err(api::store_err);
-                            if let Err(error) = &result {
-                                metrics.inc_store_write_failure();
-                                tracing::error!(vm = %rec.id, %error, "persist durable VM record");
-                            }
-                            let _ = completion.send(result);
-                        }
-                        api::StoreWrite::Exec(rec) => {
-                            if let Err(error) = s.insert_execution(&rec) {
-                                metrics.inc_store_write_failure();
-                                tracing::error!(execution = %rec.id, %error, "persist execution record");
-                            }
-                        }
-                        api::StoreWrite::Usage(ev) => {
-                            if let Err(error) = s.enqueue_usage(&ev) {
-                                metrics.inc_store_write_failure();
-                                tracing::error!(event = %ev.id, %error, "persist usage outbox event");
-                            }
-                        }
-                        api::StoreWrite::Audit(ev) => {
-                            if let Err(error) = s.enqueue_audit(&ev) {
-                                metrics.inc_store_write_failure();
-                                tracing::error!(event = %ev.id, %error, "persist audit outbox event");
-                            }
-                        }
-                    },
-                    Err(_) => {
-                        metrics.inc_store_write_failure();
-                        tracing::error!("store lock poisoned in persistence worker");
-                        if let api::StoreWrite::VmDurable(_, completion) = op {
-                            let _ = completion.send(Err(tarit_types::OrchError::Internal(
-                                "store lock poisoned during shutdown persistence".into(),
-                            )));
-                        }
-                    }
-                }
-            }
-        })
+        tokio::spawn(run_store_writer(store, metrics, store_rx, shutdown_rx))
     };
     // Cold-start every restart_policy=always VM this readopt pass left
     // Stopped (docker-`--restart=always`-like recovery). Spawned rather than
@@ -873,6 +822,121 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<Option<&'static str>>) -> &'s
     }
 }
 
+/// A durable-write attempt was rejected because the store is latched after
+/// content-level SQLite corruption (tarit#28). Distinct from every other
+/// `OrchError` variant text so a caller can tell "we suspended writes" apart
+/// from an ordinary persistence failure.
+const STORE_CORRUPTED_WRITE_ERROR: &str = "store writes suspended: SQLite reported content-level \
+     corruption (SQLITE_CORRUPT/SQLITE_NOTADB); this write was not attempted. See taritd_store_corrupted \
+     and /readyz.";
+
+/// Background write-behind persistence loop for [`api::StoreWrite`]. Extracted
+/// out of `run_server` so the fail-fast-on-corruption behavior below (tarit#28)
+/// is unit-testable without standing up a full server.
+///
+/// On an ordinary write failure this behaves exactly as before: increment the
+/// generic failure counter and log one ERROR per write. The one behavior
+/// change is content-level corruption (SQLITE_CORRUPT / SQLITE_NOTADB, never
+/// a plain disk I/O error): the first time it is observed, a sticky latch
+/// trips, one loud actionable ERROR is logged, and every following write is
+/// short-circuited before it ever touches SQLite — no more per-write ERROR
+/// spam, and no more persisting against an unrecoverable database. Reads are
+/// untouched by this loop and keep serving from the in-memory cache.
+async fn run_store_writer(
+    store: Arc<Mutex<Store>>,
+    metrics: Arc<metrics::Metrics>,
+    mut store_rx: tokio::sync::mpsc::Receiver<api::StoreWrite>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) {
+    loop {
+        let op = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+            op = store_rx.recv() => op,
+        };
+        let Some(op) = op else {
+            break;
+        };
+
+        // Fail-fast short-circuit (tarit#28): once corruption has been
+        // latched, do not touch SQLite again for the rest of the process's
+        // lifetime. Count it silently instead of repeating the loud log.
+        if metrics.is_store_corrupted() {
+            metrics.inc_store_write_suppressed();
+            if let api::StoreWrite::VmDurable(_, completion) = op {
+                let _ = completion.send(Err(tarit_types::OrchError::Internal(
+                    STORE_CORRUPTED_WRITE_ERROR.into(),
+                )));
+            }
+            continue;
+        }
+
+        match store.lock() {
+            Ok(s) => match op {
+                api::StoreWrite::VmDurable(rec, completion) => {
+                    let raw = s.insert_vm(&rec);
+                    if let Err(error) = &raw {
+                        metrics.inc_store_write_failure();
+                        tracing::error!(vm = %rec.id, %error, "persist durable VM record");
+                        latch_if_corrupted(&metrics, error);
+                    }
+                    let _ = completion.send(raw.map_err(api::store_err));
+                }
+                api::StoreWrite::Exec(rec) => {
+                    if let Err(error) = s.insert_execution(&rec) {
+                        metrics.inc_store_write_failure();
+                        tracing::error!(execution = %rec.id, %error, "persist execution record");
+                        latch_if_corrupted(&metrics, &error);
+                    }
+                }
+                api::StoreWrite::Usage(ev) => {
+                    if let Err(error) = s.enqueue_usage(&ev) {
+                        metrics.inc_store_write_failure();
+                        tracing::error!(event = %ev.id, %error, "persist usage outbox event");
+                        latch_if_corrupted(&metrics, &error);
+                    }
+                }
+                api::StoreWrite::Audit(ev) => {
+                    if let Err(error) = s.enqueue_audit(&ev) {
+                        metrics.inc_store_write_failure();
+                        tracing::error!(event = %ev.id, %error, "persist audit outbox event");
+                        latch_if_corrupted(&metrics, &error);
+                    }
+                }
+            },
+            Err(_) => {
+                metrics.inc_store_write_failure();
+                tracing::error!("store lock poisoned in persistence worker");
+                if let api::StoreWrite::VmDurable(_, completion) = op {
+                    let _ = completion.send(Err(tarit_types::OrchError::Internal(
+                        "store lock poisoned during shutdown persistence".into(),
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Classify a store write failure and, the first time it is content-level
+/// corruption (never a plain disk I/O error — see
+/// `StoreError::is_content_corruption`), trip the sticky latch and log one
+/// loud, actionable ERROR. `Metrics::mark_store_corrupted` only returns
+/// `true` on the transition, so this body runs at most once per process.
+fn latch_if_corrupted(metrics: &metrics::Metrics, error: &tarit_store::StoreError) {
+    if error.is_content_corruption() && metrics.mark_store_corrupted() {
+        tracing::error!(
+            %error,
+            "taritd store: SQLite reports CONTENT-LEVEL CORRUPTION (SQLITE_CORRUPT / SQLITE_NOTADB), \
+             not a transient disk I/O error. All further store WRITES are suspended for the rest of \
+             this process's lifetime to avoid persisting against an unrecoverable database; reads keep \
+             being served from the in-memory cache. ACTION REQUIRED: stop taritd, restore fleet.db from \
+             backup (or repair/replace the underlying disk), then restart the process. This will not \
+             self-heal and this message will not repeat — see taritd_store_corrupted, \
+             taritd_store_write_suppressed_total, and /readyz."
+        );
+    }
+}
+
 fn server_result(
     name: &str,
     result: Result<anyhow::Result<()>, tokio::task::JoinError>,
@@ -1097,6 +1161,113 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    // tarit#28: a disk carrying fleet.db went offline, the filesystem went
+    // read-only, and SQLite started reporting content-level corruption. The
+    // store_writer loop kept logging a per-write ERROR and kept accepting
+    // work against an unrecoverable database for 12 minutes straight. These
+    // tests cover the fail-fast fix: `run_store_writer` must latch on the
+    // *first* content-level corruption, short-circuit every write after
+    // without touching SQLite again, and answer the VmDurable completion
+    // channel instead of leaving the caller hanging.
+
+    #[tokio::test]
+    async fn run_store_writer_short_circuits_every_write_once_corruption_is_latched() {
+        // The store underneath is perfectly healthy: if the loop actually
+        // dispatched to it, insert_vm would succeed and the completion
+        // channel would receive Ok(()). Observing the distinct corruption
+        // error instead proves the short-circuit fired *before* SQLite was
+        // touched, not that the healthy store happened to fail.
+        let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let metrics = Arc::new(metrics::Metrics::default());
+        assert!(
+            metrics.mark_store_corrupted(),
+            "test setup: latch must trip on this first call"
+        );
+
+        // Keep the shutdown sender alive for the duration of the test: a
+        // dropped/never-sent watch sender makes `wait_for_shutdown` resolve
+        // immediately, which would race the loop's shutdown branch against
+        // the write below. The loop exits via `store_tx` being dropped at
+        // the end of this test instead.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
+        let (store_tx, store_rx) = tokio::sync::mpsc::channel::<api::StoreWrite>(8);
+        let writer = tokio::spawn(run_store_writer(
+            Arc::clone(&store),
+            Arc::clone(&metrics),
+            store_rx,
+            shutdown_rx,
+        ));
+
+        let vm = sweep_test_vm("this-host", VmStatus::Stopped, RestartPolicy::No);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        store_tx
+            .send(api::StoreWrite::VmDurable(vm.clone(), completion_tx))
+            .await
+            .unwrap();
+
+        let result = completion_rx.await.unwrap();
+        let error = match result {
+            Err(e) => e,
+            Ok(()) => panic!(
+                "a short-circuited write must not reach the healthy store and succeed silently"
+            ),
+        };
+        assert!(
+            error.to_string().contains("suspended"),
+            "completion error must be the distinguishable corruption message, got: {error}"
+        );
+        assert_eq!(
+            metrics.store_write_failures_total(),
+            0,
+            "a suppressed write must not also count as an ordinary write failure"
+        );
+        assert_eq!(metrics.store_write_suppressed_total(), 1);
+        assert!(
+            store.lock().unwrap().get_vm(vm.id).is_err(),
+            "the short-circuited VmDurable write must never have reached the store"
+        );
+
+        drop(store_tx);
+        writer.await.unwrap();
+    }
+
+    #[test]
+    fn latch_if_corrupted_trips_only_for_content_corruption_never_for_ordinary_errors() {
+        let metrics = metrics::Metrics::default();
+
+        // An ordinary NotFound is not corruption and must never latch.
+        let store = Store::open(":memory:").unwrap();
+        let not_found = store.get_vm(Uuid::new_v4()).unwrap_err();
+        latch_if_corrupted(&metrics, &not_found);
+        assert!(
+            !metrics.is_store_corrupted(),
+            "an ordinary store error must never latch the store"
+        );
+
+        // A genuinely non-sqlite file produces a real, non-synthetic
+        // content-level corruption StoreError straight out of Store::open
+        // (see tarit-store's own tests for the SQLITE_CORRUPT/SQLITE_NOTADB
+        // classification boundary in isolation).
+        let path =
+            std::env::temp_dir().join(format!("taritd-main-corrupt-test-{}.db", Uuid::new_v4()));
+        std::fs::write(&path, b"not a sqlite database; garbage header bytes").unwrap();
+        let corrupt = match Store::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("opening a non-sqlite file must fail"),
+        };
+        let _ = std::fs::remove_file(&path);
+
+        latch_if_corrupted(&metrics, &corrupt);
+        assert!(
+            metrics.is_store_corrupted(),
+            "content-level corruption must latch the store"
+        );
+
+        // Repeat calls of either kind must not un-latch or panic.
+        latch_if_corrupted(&metrics, &not_found);
+        assert!(metrics.is_store_corrupted());
     }
 
     #[test]

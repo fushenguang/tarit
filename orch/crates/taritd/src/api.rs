@@ -604,6 +604,7 @@ async fn startupz(State(state): State<AppState>) -> Response {
     let mut checks = BTreeMap::new();
     checks.insert("configuration", "ok");
     checks.insert("local_store", local_store_health(&state));
+    checks.insert("store_integrity", store_integrity_check(&state));
     checks.insert(
         "persistence_queue",
         if state.store_tx.is_closed() {
@@ -618,6 +619,7 @@ async fn startupz(State(state): State<AppState>) -> Response {
 async fn readyz(State(state): State<AppState>) -> Response {
     let mut checks = BTreeMap::new();
     checks.insert("local_store", local_store_health(&state));
+    checks.insert("store_integrity", store_integrity_check(&state));
     checks.insert(
         "persistence_queue",
         if state.store_tx.is_closed() {
@@ -671,6 +673,26 @@ fn local_store_health(state: &AppState) -> &'static str {
         // normal write load.
         Err(std::sync::TryLockError::WouldBlock) => "ok",
         Err(std::sync::TryLockError::Poisoned(_)) => "poisoned",
+    }
+}
+
+/// Surfaces the tarit#28 fail-fast latch: once content-level SQLite
+/// corruption has been detected, `metrics.is_store_corrupted()` is sticky for
+/// the rest of the process's lifetime (see `main::latch_if_corrupted`). This
+/// reads the latch directly rather than re-probing SQLite, so it stays
+/// accurate even while writes are being short-circuited.
+///
+/// Deliberately wired into `/readyz` and `/startupz` (take this instance out
+/// of new-work rotation) and NOT into `/health` / `/livez`: a corrupt store
+/// does not mean the process itself is unhealthy or should be restarted —
+/// restarting would immediately face the same corrupt database again, and
+/// the whole point of fail-fast-without-exiting is to keep the process up so
+/// reads and diagnostics stay available.
+fn store_integrity_check(state: &AppState) -> &'static str {
+    if state.metrics.is_store_corrupted() {
+        "corrupt"
+    } else {
+        "ok"
     }
 }
 
@@ -2779,6 +2801,49 @@ mod tests {
         assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
         let value = rt.block_on(response_json(unavailable));
         assert_eq!(value["error"], "service unavailable");
+    }
+
+    // tarit#28: once SQLite reports content-level corruption, the fail-fast
+    // latch must be visible to operators through the same health-check
+    // family they already poll, not only via logs. /readyz and /startupz
+    // take a corrupt instance out of rotation for new work; /health and
+    // /livez are deliberately left untouched (see `store_integrity_check`)
+    // so a corrupt store does not read as "this process should be
+    // restarted" — restarting would just face the same corrupt database.
+    #[test]
+    fn readyz_and_startupz_report_store_integrity_corrupt_once_latched() {
+        let rt = test_runtime();
+        // test_state() drops its paired store_rx immediately, which closes
+        // store_tx and makes every /readyz "persistence_queue" check report
+        // "closed" independent of this test. Keep the receiver alive via
+        // test_state_with_audit() so the only unhealthy check we assert on
+        // is the one this test is actually about: store_integrity.
+        let (state, _store_rx) = test_state_with_audit();
+
+        let ready_before = rt.block_on(readyz(State(state.clone())));
+        assert_eq!(ready_before.status(), StatusCode::OK);
+        let before = rt.block_on(response_json(ready_before));
+        assert_eq!(before["checks"]["store_integrity"], "ok");
+
+        state.metrics.mark_store_corrupted();
+
+        let ready_after = rt.block_on(readyz(State(state.clone())));
+        assert_eq!(ready_after.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let after = rt.block_on(response_json(ready_after));
+        assert_eq!(after["checks"]["store_integrity"], "corrupt");
+        assert_eq!(after["status"], "unhealthy");
+
+        let startup_after = rt.block_on(startupz(State(state.clone())));
+        assert_eq!(startup_after.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let startup_value = rt.block_on(response_json(startup_after));
+        assert_eq!(startup_value["checks"]["store_integrity"], "corrupt");
+
+        // /health and /livez must stay unaffected: corruption is a
+        // readiness/startup concern, not a liveness one.
+        let health_after = rt.block_on(health(State(state.clone())));
+        assert_eq!(health_after.status(), StatusCode::OK);
+        let livez_after = rt.block_on(livez(State(state)));
+        assert_eq!(livez_after.status(), StatusCode::OK);
     }
 
     #[test]
