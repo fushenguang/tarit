@@ -46,6 +46,62 @@ static STATE_WRITE_SEQUENCE: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 static FAIL_NEXT_STATE_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
 
+/// The host's own `net.ipv4.ip_forward` value from *before* taritd ever
+/// wrote to it, captured once at the top of `NetProvisioner::new` (see
+/// `capture_original_ipv4_forward`) and consulted by every emergency/
+/// teardown path that would otherwise touch the global switch.
+///
+/// 2026-08-05 production incident (tarit#30): every fail-closed/teardown
+/// path hard-wrote `net.ipv4.ip_forward=0`, on the assumption that taritd is
+/// the only thing on the host that cares about IP forwarding. On a host
+/// that also runs Docker Swarm, that sysctl is shared global kernel state:
+/// Swarm's service-VIP routing needs it too, and hard-writing 0 silently
+/// killed every published service (including Dokploy's own Postgres) for 99
+/// minutes. Restoring the value the host had before taritd started -
+/// instead of a hardcoded 0 - means taritd only ever undoes its own change.
+static ORIGINAL_IPV4_FORWARD: Mutex<Option<bool>> = Mutex::new(None);
+
+/// Read the host's current `net.ipv4.ip_forward` and remember it as the
+/// value to restore on emergency/teardown paths. Must run before anything
+/// else in `NetProvisioner::new` writes to that sysctl.
+///
+/// Deliberately infallible: a transient failure to read the pre-existing
+/// value must not block taritd from starting. Falling back to "was off"
+/// (the historical hardcoded behavior) is the conservative choice - it only
+/// costs taritd its own forwarding on the very next emergency path, never a
+/// neighbor's.
+fn capture_original_ipv4_forward() {
+    match command_stdout("sysctl", &["-n", "net.ipv4.ip_forward"]) {
+        Ok(value) => {
+            if let Ok(mut original) = ORIGINAL_IPV4_FORWARD.lock() {
+                *original = Some(value.trim() == "1");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "net: could not read pre-existing net.ipv4.ip_forward ({error}); emergency \
+                 containment will conservatively restore it to disabled (0) if it ever fires"
+            );
+        }
+    }
+}
+
+/// What emergency/teardown paths should restore `net.ipv4.ip_forward` to.
+/// Defaults to `false` if capture never ran (should not happen in
+/// production - see `NetProvisioner::new`) or failed.
+fn original_ipv4_forward_enabled() -> bool {
+    ORIGINAL_IPV4_FORWARD
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn set_original_ipv4_forward_for_test(value: bool) {
+    *ORIGINAL_IPV4_FORWARD.lock().unwrap() = Some(value);
+}
+
 /// A provisioned per-VM network: the tap name and the /30 addressing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetAlloc {
@@ -132,6 +188,9 @@ impl NetProvisioner {
         live_vm_ids: impl IntoIterator<Item = Uuid>,
     ) -> Result<Self, OrchError> {
         let live_vm_ids = live_vm_ids.into_iter().collect::<HashSet<_>>();
+        // Capture the host's pre-existing forwarding state before anything
+        // below (including preflight containment) can write to it.
+        capture_original_ipv4_forward();
         // This is deliberately the first fallible startup action. A corrupt
         // state file or failed uplink lookup must not leave an old Tarit TAP
         // forwarding while recovery cannot establish its owner or policy.
@@ -2064,9 +2123,27 @@ fn emergency_isolate_tap_names(taps: &[String]) -> IsolationReport {
     report
 }
 
+/// Emergency/teardown containment commands. `net.ipv4.ip_forward` restores
+/// to whatever the host had *before* taritd started (see
+/// `ORIGINAL_IPV4_FORWARD`) rather than hard-writing 0, so this can never
+/// disable forwarding a co-resident service (e.g. Docker Swarm) depends on.
+///
+/// `net.ipv6.conf.all.forwarding` is left as a hardcoded disable: it is not
+/// part of the confirmed tarit#30 incident, and taritd does not enable IPv6
+/// forwarding anywhere in `host_nft_base_argv`, so there is no taritd-owned
+/// "on" state to restore here in the first place.
 fn emergency_forwarding_disable_argv() -> Vec<Vec<String>> {
+    let ip_forward_value = if original_ipv4_forward_enabled() {
+        "1"
+    } else {
+        "0"
+    };
     vec![
-        command_argv(&["sysctl", "-qw", "net.ipv4.ip_forward=0"]),
+        command_argv(&[
+            "sysctl",
+            "-qw",
+            &format!("net.ipv4.ip_forward={ip_forward_value}"),
+        ]),
         command_argv(&["sysctl", "-qw", "net.ipv6.conf.all.forwarding=0"]),
     ]
 }
@@ -5392,6 +5469,115 @@ esac
     }
 
     #[test]
+    fn emergency_containment_never_disables_forwarding_a_co_resident_service_relies_on() {
+        // End-to-end regression test for the 2026-08-05 production incident
+        // (tarit#30): this is the exact `failed_quarantine_installation_
+        // emergency_isolates_every_recovered_tap` recovery failure above,
+        // except the host is one where something *other than taritd*
+        // (e.g. Docker Swarm, for its service-VIP routing) already turned
+        // `net.ipv4.ip_forward` on before taritd ever started. Emergency
+        // containment must never hard-write it back to 0 -- doing so is
+        // exactly what took Dokploy's own Postgres, and every other
+        // published Swarm service, offline for 99 minutes.
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_vm_id = Uuid::new_v4();
+        let second_vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-recovery-preserves-host-forwarding-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &state_path,
+            format!(
+                r#"{{"version":2,"allocations":[{{"slot":7,"vm_id":"{first_vm_id}","tap":"insta7","egress":{{"allowlist":[],"allow_existing":false}}}},{{"slot":8,"vm_id":"{second_vm_id}","tap":"insta8","egress":{{"allowlist":[],"allow_existing":false}}}}]}}"#,
+            ),
+        )
+        .unwrap();
+
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
+  "ip:link set insta7 down") echo "simulated link-down failure" >&2; exit 1 ;;
+  "ip:link del insta7") echo "simulated link-delete failure" >&2; exit 1 ;;
+  "ip:-j link show") echo '[]' ;;
+  "sysctl:-n net.ipv4.ip_forward") echo "1" ;;
+  "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-f -") cat >/dev/null; echo "simulated quarantine failure" >&2; exit 1 ;;
+esac
+"#;
+        for name in ["ip", "nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        let result = NetProvisioner::new(state_path, [first_vm_id, second_vm_id]);
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+
+        assert!(
+            result.is_err(),
+            "quarantine failure unexpectedly recovered allocations"
+        );
+        let commands = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // The whole point of the fix: never a hardcoded 0, anywhere in the
+        // command sequence, no matter how many emergency paths fire.
+        assert!(
+            !commands.contains("net.ipv4.ip_forward=0"),
+            "must never hard-write ip_forward=0 when the host had it on before taritd \
+             started:\n{commands}"
+        );
+        // And the emergency containment path did run and did restore
+        // forwarding (to what the host already had) *after* the quarantine
+        // failure, rather than skipping the sysctl write entirely. (The
+        // startup enable in `host_nft_base_argv` also writes this same
+        // line earlier, hence `rfind` for the last occurrence.)
+        let quarantine = commands.find("nft -f -").unwrap();
+        assert!(
+            commands
+                .rfind("sysctl -qw net.ipv4.ip_forward=1")
+                .is_some_and(|index| quarantine < index),
+            "emergency containment did not restore forwarding after the quarantine \
+             failure:\n{commands}"
+        );
+    }
+
+    #[test]
     fn later_recovery_failure_keeps_every_recovered_tap_quarantined_and_down() {
         let _environment_guard = RECOVERY_TEST_LOCK
             .lock()
@@ -6199,7 +6385,32 @@ esac
     }
 
     #[test]
-    fn catastrophic_fallback_disables_both_forwarding_families() {
+    fn catastrophic_fallback_restores_pre_existing_forwarding_state_instead_of_hardcoding_zero() {
+        // Regression test for the 2026-08-05 production incident (tarit#30):
+        // every emergency/teardown path hard-wrote `net.ipv4.ip_forward=0`,
+        // assuming taritd was the only consumer of that global sysctl. On a
+        // host that also runs Docker Swarm (which shares the same switch for
+        // its service-VIP routing), that hardcoded 0 silently killed every
+        // published service for 99 minutes. The fallback must restore
+        // whatever the host had *before* taritd started, never a literal 0.
+        set_original_ipv4_forward_for_test(true);
+        let argv_when_forwarding_was_on_before_taritd = emergency_forwarding_disable_argv();
+        assert!(
+            !argv_when_forwarding_was_on_before_taritd
+                .iter()
+                .any(|command| command.join(" ").contains("net.ipv4.ip_forward=0")),
+            "must never hard-write ip_forward=0 when the host had it on before taritd \
+             started: {argv_when_forwarding_was_on_before_taritd:?}"
+        );
+        assert_eq!(
+            argv_when_forwarding_was_on_before_taritd,
+            vec![
+                argv(&["sysctl", "-qw", "net.ipv4.ip_forward=1"]),
+                argv(&["sysctl", "-qw", "net.ipv6.conf.all.forwarding=0"]),
+            ]
+        );
+
+        set_original_ipv4_forward_for_test(false);
         assert_eq!(
             emergency_forwarding_disable_argv(),
             vec![
