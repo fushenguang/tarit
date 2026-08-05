@@ -818,6 +818,19 @@ mod tests {
             .join("../../target/test-work")
             .join(format!("{name}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // `open_private_overlay` rejects a group/world-writable parent
+        // directory (tarit#29). `target/` is created under the ambient
+        // umask (typically 002), which leaves fresh directories mode 0775 —
+        // exactly the shape the guard is designed to reject. Lock the
+        // directory down to owner-only so tests exercise the same
+        // constraint a real overlay directory must satisfy, instead of
+        // relying on whatever `/tmp`'s 1777 sticky-but-world-writable mode
+        // happens to allow.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         dir
     }
 
@@ -962,9 +975,9 @@ mod tests {
 
     #[test]
     fn cow_write_goes_to_overlay_and_leaves_base_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.img");
-        let overlay = dir.path().join("vm.overlay");
+        let dir = local_test_dir("cow-write-overlay");
+        let base = dir.join("base.img");
+        let overlay = dir.join("vm.overlay");
         write_block_pattern(&base, &[0x11, 0x22]);
         let original_base = std::fs::read(&base).unwrap();
 
@@ -984,13 +997,15 @@ mod tests {
         let mut overlay_block = [0u8; SECTOR_SIZE_USIZE];
         read_exact_at(&mut overlay_file, header.data_offset, &mut overlay_block).unwrap();
         assert_eq!(overlay_block, [0xAA; SECTOR_SIZE_USIZE]);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn cow_reads_unwritten_blocks_from_base_and_written_blocks_from_overlay() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.img");
-        let overlay = dir.path().join("vm.overlay");
+        let dir = local_test_dir("cow-read-unwritten");
+        let base = dir.join("base.img");
+        let overlay = dir.join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20, 0x30]);
 
         let mut backend = BlkBackend::open_cow(&base, &overlay).unwrap();
@@ -1008,13 +1023,15 @@ mod tests {
             service_read(&mut backend, 2, SECTOR_SIZE_USIZE),
             [0x30; 512]
         );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn cow_overlay_dirty_bitmap_persists_after_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.img");
-        let overlay = dir.path().join("vm.overlay");
+        let dir = local_test_dir("cow-dirty-bitmap-reopen");
+        let base = dir.join("base.img");
+        let overlay = dir.join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20]);
 
         {
@@ -1035,14 +1052,16 @@ mod tests {
             service_read(&mut reopened, 1, SECTOR_SIZE_USIZE),
             [0xDD; 512]
         );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn cow_two_overlays_share_base_but_keep_private_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.img");
-        let overlay_a = dir.path().join("a.overlay");
-        let overlay_b = dir.path().join("b.overlay");
+        let dir = local_test_dir("cow-two-overlays");
+        let base = dir.join("base.img");
+        let overlay_a = dir.join("a.overlay");
+        let overlay_b = dir.join("b.overlay");
         write_block_pattern(&base, &[0x44]);
         let original_base = std::fs::read(&base).unwrap();
 
@@ -1054,6 +1073,8 @@ mod tests {
         assert_eq!(service_read(&mut a, 0, SECTOR_SIZE_USIZE), [0xA1; 512]);
         assert_eq!(service_read(&mut b, 0, SECTOR_SIZE_USIZE), [0xB2; 512]);
         assert_eq!(std::fs::read(&base).unwrap(), original_base);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1104,9 +1125,9 @@ mod tests {
 
     #[test]
     fn cow_flush_and_fua_sync_overlay_without_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.img");
-        let overlay = dir.path().join("vm.overlay");
+        let dir = local_test_dir("cow-flush-fua");
+        let base = dir.join("base.img");
+        let overlay = dir.join("vm.overlay");
         write_block_pattern(&base, &[0x55]);
 
         let mut backend = BlkBackend::open_cow(&base, &overlay).unwrap();
@@ -1124,13 +1145,15 @@ mod tests {
             service_read(&mut reopened, 0, SECTOR_SIZE_USIZE),
             [0xEF; 512]
         );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn cow_partial_write_preserves_base_bytes_and_handles_last_block() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.img");
-        let overlay = dir.path().join("vm.overlay");
+        let dir = local_test_dir("cow-partial-write");
+        let base = dir.join("base.img");
+        let overlay = dir.join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20, 0x30]);
 
         let mut backend = BlkBackend::open_cow(&base, &overlay).unwrap();
@@ -1142,19 +1165,23 @@ mod tests {
         let sector_two = service_read(&mut backend, 2, SECTOR_SIZE_USIZE);
         assert_eq!(&sector_two[..88], &[0x99; 88]);
         assert_eq!(&sector_two[88..], &[0x30; SECTOR_SIZE_USIZE - 88]);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn cow_rejects_request_that_crosses_device_end() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.img");
-        let overlay = dir.path().join("vm.overlay");
+        let dir = local_test_dir("cow-crosses-end");
+        let base = dir.join("base.img");
+        let overlay = dir.join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20]);
 
         let mut backend = BlkBackend::open_cow(&base, &overlay).unwrap();
         let mut data = vec![0x77; SECTOR_SIZE_USIZE + 1];
         let status = backend.service(&hdr(req_type::OUT, 1), &mut data);
         assert_eq!(status, status::IO_ERR);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
@@ -1197,10 +1224,10 @@ mod tests {
     fn cow_rejects_non_private_or_hardlinked_existing_overlay() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join("base.img");
-        let overlay = dir.path().join("vm.overlay");
-        let alias = dir.path().join("alias.overlay");
+        let dir = local_test_dir("cow-rejects-hardlink");
+        let base = dir.join("base.img");
+        let overlay = dir.join("vm.overlay");
+        let alias = dir.join("alias.overlay");
         write_block_pattern(&base, &[0x10]);
         drop(BlkBackend::open_cow(&base, &overlay).unwrap());
 
@@ -1213,6 +1240,8 @@ mod tests {
             .err()
             .expect("hardlinked overlay must fail");
         assert!(error.to_string().contains("hard links"));
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
