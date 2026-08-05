@@ -696,9 +696,14 @@ impl NetProvisioner {
                     // as "policy for an inactive allocation" to the closed-
                     // ownership revalidation that runs before that batch
                     // release ever gets a chance to run.
-                    if let Err(error) =
-                        self.delete_recovery_quarantine_atomically(std::slice::from_ref(alloc))
-                    {
+                    //
+                    // `teardown_locked` above already deleted every nft rule
+                    // tagged for this alloc, including this same quarantine
+                    // rule (`delete_nft_rules_for_alloc` does not filter by
+                    // rule kind), so finding it already gone here is the
+                    // expected common case, not an error -- see tarit#30 bug
+                    // 2's production follow-up incident.
+                    if let Err(error) = self.release_quarantine_for_freed_stale_allocation(alloc) {
                         return Err(self.recovery_failure_after_cleanup(
                             allocations,
                             "release quarantine for freed stale recovered allocation",
@@ -789,10 +794,43 @@ impl NetProvisioner {
         &self,
         allocations: &[NetAlloc],
     ) -> Result<(), OrchError> {
+        self.delete_recovery_quarantine_atomically_with_policy(
+            allocations,
+            MissingRecoveryQuarantine::IsUnexpected,
+        )
+    }
+
+    /// Release the recovery quarantine for an allocation `reconcile_recovered_allocations`
+    /// just judged stale (its TAP is gone) and tore down via `teardown_locked`. That
+    /// teardown's blanket per-alloc nft cleanup (`delete_nft_rules_for_alloc`) is
+    /// kind-agnostic, so it may already have removed this exact quarantine rule; if so,
+    /// this is "already released", not a fresh failure -- see tarit#30 bug 2's follow-up
+    /// production incident, where treating it as an error crashed taritd right back into
+    /// the restart loop that bug 2's original fix (e57e6a1) was meant to end.
+    fn release_quarantine_for_freed_stale_allocation(
+        &self,
+        alloc: &NetAlloc,
+    ) -> Result<(), OrchError> {
+        self.delete_recovery_quarantine_atomically_with_policy(
+            std::slice::from_ref(alloc),
+            MissingRecoveryQuarantine::MeansAlreadyReleased,
+        )
+    }
+
+    fn delete_recovery_quarantine_atomically_with_policy(
+        &self,
+        allocations: &[NetAlloc],
+        on_missing: MissingRecoveryQuarantine,
+    ) -> Result<(), OrchError> {
         if allocations.is_empty() {
             return Ok(());
         }
-        let script = recovery_quarantine_delete_script(allocations)?;
+        let script = recovery_quarantine_delete_script(allocations, on_missing)?;
+        if script.trim().is_empty() {
+            // Every allocation's quarantine was already gone (only reachable
+            // with `MeansAlreadyReleased`) -- nothing left to tell nft to do.
+            return Ok(());
+        }
         run_nft_script(&script)
     }
 
@@ -2655,7 +2693,30 @@ fn recovery_quarantine_script(allocations: &[NetAlloc]) -> String {
         + "\n"
 }
 
-fn recovery_quarantine_delete_script(allocations: &[NetAlloc]) -> Result<String, OrchError> {
+/// How a missing recovery-quarantine record should be treated when we go to
+/// release it. Ordinarily it is unexplained and must fail closed (see
+/// `MissingRecoveryQuarantine::IsUnexpected`), mirroring the fail-closed
+/// stance `net.rs::delete_ingress_table_for_slot` takes for an nftables
+/// comment it cannot cleanly attribute (fushenguang/tarit#13): never guess
+/// past an ownership question we cannot answer.
+///
+/// The one exception is an allocation `reconcile_recovered_allocations` just
+/// judged stale (its TAP is gone) and handed to `teardown_locked`:
+/// `delete_nft_rules_for_alloc` there removes *every* nft rule tagged for
+/// that alloc regardless of kind, which already includes its own recovery
+/// quarantine rule. A second, explicit release attempt right after that
+/// finding nothing is simply "already released", not a fresh failure -- see
+/// `MissingRecoveryQuarantine::MeansAlreadyReleased`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MissingRecoveryQuarantine {
+    IsUnexpected,
+    MeansAlreadyReleased,
+}
+
+fn recovery_quarantine_delete_script(
+    allocations: &[NetAlloc],
+    on_missing: MissingRecoveryQuarantine,
+) -> Result<String, OrchError> {
     let mut commands = Vec::new();
     for chain in [NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
         let listing = command_stdout("nft", &["-a", "list", "chain", "ip", NFT_TABLE, chain])?;
@@ -2669,10 +2730,15 @@ fn recovery_quarantine_delete_script(allocations: &[NetAlloc]) -> Result<String,
                 .filter_map(nft_handle)
                 .collect::<Vec<_>>();
             if handles.is_empty() {
-                return Err(OrchError::Internal(format!(
-                    "net: missing recovery quarantine for {} in {chain}",
-                    alloc.tap
-                )));
+                match on_missing {
+                    MissingRecoveryQuarantine::IsUnexpected => {
+                        return Err(OrchError::Internal(format!(
+                            "net: missing recovery quarantine for {} in {chain}",
+                            alloc.tap
+                        )));
+                    }
+                    MissingRecoveryQuarantine::MeansAlreadyReleased => continue,
+                }
             }
             commands.extend(
                 handles
@@ -5489,6 +5555,308 @@ esac
         assert!(
             !persisted.contains(&vm_id.to_string()),
             "the stale allocation must be freed from persisted state: {persisted}"
+        );
+    }
+
+    #[test]
+    fn stale_recovered_allocation_whose_quarantine_teardown_already_released_still_starts_cleanly()
+    {
+        // Regression test for the production incident on 2026-08-05,
+        // immediately downstream of e57e6a1 (tarit#30 bug 2). That commit's
+        // fix genuinely worked: taritd logged the "recovered policy ...
+        // refers to TAP ... which no longer exists" warning and moved on to
+        // free the slot. But the very next step crashed it right back into
+        // the restart loop bug 2 was supposed to end:
+        //
+        //   internal error: net: release quarantine for freed stale
+        //     recovered allocation: internal error: net: missing recovery
+        //     quarantine for insta0 in vm_egress
+        //
+        // Root cause: once a recovered allocation's TAP is judged stale,
+        // `reconcile_recovered_allocations` calls `teardown_locked`, whose
+        // `delete_nft_rules_for_alloc` removes *every* nft rule tagged for
+        // that alloc (`is_taritd_nft_rule_for_alloc` matches by slot/vm/tap
+        // only -- it does not filter by rule kind) -- including this same
+        // allocation's own recovery-quarantine rule in both vm_egress and
+        // vm_input. Immediately afterward, the (redundant) explicit
+        // "release this allocation's recovery quarantine now" step tries to
+        // delete that same quarantine rule *again* and, finding it already
+        // gone, treated that as a fatal error instead of "already released".
+        //
+        // This only reproduces with a mock that actually reflects the
+        // individual `nft delete rule ... handle N` commands
+        // `delete_nft_rules_for_alloc` issues (one handle at a time, not a
+        // batched `nft -f -` script) in later listings -- the original
+        // tarit#30-bug-2 regression test's mock only reacted to batched
+        // `nft -f -` scripts, so it never actually modeled this rule being
+        // gone by the time the explicit release step ran, and passed
+        // without ever exercising this path.
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-recovery-stale-quarantine-race-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let fake_state = root.join("fake-state");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &state_path,
+            format!(
+                r#"{{"version":2,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7","egress":{{"allowlist":[],"allow_existing":false}}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        // Same "clean reboot, no TAPs at all" shape as the original tarit#30
+        // bug 2 regression test, but the vm_egress/vm_input recovery
+        // quarantine rules are now tracked with independent flags (one per
+        // chain, matching real nftables state, where each chain's rule has
+        // its own handle) and both the individual `nft delete rule ...
+        // handle N` command and the batched `nft -f -` deletion script
+        // actually clear them.
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
+  "ip:-j link show") echo '[]' ;;
+  "ip:-o link show") : ;;
+  "ip:link set insta7 down") echo "Cannot find device \"insta7\"" >&2; exit 1 ;;
+  "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-a list chain ip taritd_nat vm_egress")
+    [ ! -e "$TARIT_TEST_FAKE_STATE.egress_quarantine" ] || echo "iifname \"insta7\" drop comment \"taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 20"
+    ;;
+  "nft:-a list chain ip taritd_nat vm_input")
+    [ ! -e "$TARIT_TEST_FAKE_STATE.input_quarantine" ] || echo "iifname \"insta7\" drop comment \"taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 21"
+    ;;
+  "nft:delete rule ip taritd_nat vm_egress handle 20") rm -f "$TARIT_TEST_FAKE_STATE.egress_quarantine" ;;
+  "nft:delete rule ip taritd_nat vm_input handle 21") rm -f "$TARIT_TEST_FAKE_STATE.input_quarantine" ;;
+  "nft:-f -")
+    script=$(cat)
+    case "$script" in
+      *"insert rule ip taritd_nat vm_egress"*"recovery-quarantine"*)
+        touch "$TARIT_TEST_FAKE_STATE.egress_quarantine"
+        touch "$TARIT_TEST_FAKE_STATE.input_quarantine"
+        ;;
+      *"delete rule ip taritd_nat vm_egress handle "*)
+        rm -f "$TARIT_TEST_FAKE_STATE.egress_quarantine"
+        printf '%s\n' "$script" | grep -F "delete rule ip taritd_nat vm_input handle " >/dev/null &&
+          rm -f "$TARIT_TEST_FAKE_STATE.input_quarantine"
+        ;;
+      *) echo "unexpected nft transaction: $script" >&2; exit 1 ;;
+    esac
+    ;;
+esac
+"#;
+        for name in ["ip", "nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_FAKE_STATE", &fake_state);
+        std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
+        let result = NetProvisioner::new(state_path.clone(), [vm_id]);
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+        std::env::remove_var("TARIT_TEST_FAKE_STATE");
+        std::env::remove_var("TARIT_TEST_VM_ID");
+
+        let commands = std::fs::read_to_string(&log).unwrap();
+        let persisted = std::fs::read_to_string(&state_path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        result.unwrap_or_else(|error| {
+            panic!(
+                "startup must survive teardown_locked already having released this alloc's \
+                 own recovery quarantine while freeing a stale allocation -- a missing \
+                 quarantine record for an allocation we just tore down means \"already \
+                 released\", not a fresh failure: {error}\ncommands:\n{commands}"
+            )
+        });
+        assert!(
+            !persisted.contains(&vm_id.to_string()),
+            "the stale allocation must still be freed from persisted state: {persisted}"
+        );
+    }
+
+    #[test]
+    fn still_owned_allocation_fails_closed_when_recovery_quarantine_is_unexpectedly_missing() {
+        // Guardrail test: the tolerance added for the race above must stay
+        // scoped to allocations `reconcile_recovered_allocations` just judged
+        // stale and tore down. For a *still-owned* allocation (TAP present,
+        // policy programmed and verified, never handed to `teardown_locked`),
+        // a missing recovery-quarantine record at the final batch release in
+        // `NetProvisioner::new` is unexplained and must still fail closed --
+        // exactly the fushenguang/tarit#13 precedent this task must not
+        // erode ("refusing to delete ingress table: exact managed owner is
+        // unknown" fails closed rather than guessing; the same stance
+        // applies here to an ownership record that should exist but does
+        // not).
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-recovery-live-missing-quarantine-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let fake_state = root.join("fake-state");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &state_path,
+            format!(
+                r#"{{"version":2,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7","egress":{{"allowlist":["198.51.100.10:443"],"allow_existing":true}}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        // A normal, fully successful live-allocation recovery (TAP present
+        // throughout, policy programmed and verified) -- except the
+        // recovery-quarantine insert transaction never actually lands in
+        // any later chain listing. Nothing else in this fixture depends on
+        // that rule existing, so this isolates exactly the one thing under
+        // test: the strict (non-stale) release path at the end of
+        // `NetProvisioner::new` must still refuse to treat a missing
+        // quarantine record as "nothing to do".
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
+  "ip:-o link show") echo "7: insta7: <BROADCAST,UP> mtu 1500" ;;
+  "ip:-j link show") echo '[{"ifname":"insta7"}]' ;;
+  "ip:link set insta7 down") : ;;
+  "ip:link set insta7 up") : ;;
+  "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
+  "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
+  "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
+  "nft:add table netdev taritd_ingress_7") touch "$TARIT_TEST_FAKE_STATE.policy" ;;
+  "nft:-a list table netdev taritd_ingress_7")
+    echo "table netdev taritd_ingress_7 { chain ingress { type filter hook ingress device \"insta7\" priority filter; policy drop; ether type arp accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"; ether type ip accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"; } }"
+    ;;
+  "nft:-f -")
+    script=$(cat)
+    case "$script" in
+      *"insert rule ip taritd_nat vm_egress"*"recovery-quarantine"*)
+        # Deliberately does NOT record the quarantine as installed: this
+        # models the record being unexpectedly absent for a still-owned
+        # allocation, which is exactly the "should never happen" case the
+        # strict release path exists to catch.
+        :
+        ;;
+      *) echo "unexpected nft transaction: $script" >&2; exit 1 ;;
+    esac
+    ;;
+  "nft:-a list chain ip taritd_nat post")
+    if [ -e "$TARIT_TEST_FAKE_STATE.policy" ]; then
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 11"
+    fi
+    ;;
+  "nft:-a list chain ip taritd_nat vm_egress")
+    if [ -e "$TARIT_TEST_FAKE_STATE.policy" ]; then
+      echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 12"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 13"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 14"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 15"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10 tcp dport 443 accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 16"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 17"
+    fi
+    ;;
+  "nft:-a list chain ip taritd_nat vm_input")
+    if [ -e "$TARIT_TEST_FAKE_STATE.policy" ]; then
+      echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 15"
+      echo "iifname \"insta7\" ct state established,related accept comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 16"
+      echo "iifname \"insta7\" drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 17"
+    fi
+    ;;
+esac
+"#;
+        for name in ["ip", "nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_FAKE_STATE", &fake_state);
+        std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
+        let result = NetProvisioner::new(state_path.clone(), [vm_id]);
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+        std::env::remove_var("TARIT_TEST_FAKE_STATE");
+        std::env::remove_var("TARIT_TEST_VM_ID");
+
+        let commands = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let error = match result {
+            Ok(_) => panic!(
+                "a still-owned allocation with an unexpectedly missing recovery quarantine \
+                 record must fail closed, not silently continue:\n{commands}"
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("missing recovery quarantine"),
+            "unexpected error shape: {error}"
         );
     }
 
