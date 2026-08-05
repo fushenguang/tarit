@@ -226,7 +226,11 @@ impl NetProvisioner {
                 ));
             }
         }
-        provisioner.reconcile_recovered_allocations(&recovered_allocations)?;
+        // Allocations whose TAP turned out to be gone (tarit#30 bug 2, e.g.
+        // a host reboot) were freed and un-quarantined inside reconciliation
+        // already; only what's still owned needs releasing here.
+        let still_owned_allocations =
+            provisioner.reconcile_recovered_allocations(&recovered_allocations)?;
         if let Err(error) = (|| {
             let allocator = provisioner
                 .inner
@@ -249,7 +253,7 @@ impl NetProvisioner {
             ));
         }
         if let Err(error) =
-            provisioner.delete_recovery_quarantine_atomically(&recovered_allocations)
+            provisioner.delete_recovery_quarantine_atomically(&still_owned_allocations)
         {
             return Err(provisioner.recovery_failure_after_cleanup(
                 &recovered_allocations,
@@ -611,7 +615,15 @@ impl NetProvisioner {
         Ok(())
     }
 
-    fn reconcile_recovered_allocations(&self, allocations: &[NetAlloc]) -> Result<(), OrchError> {
+    /// Returns the subset of `allocations` that are still owned (TAP present,
+    /// policy programmed and verified) after reconciliation. A stale
+    /// allocation whose TAP no longer exists is freed here and excluded from
+    /// the returned list, so callers never try to raise or un-quarantine a
+    /// device that is not there.
+    fn reconcile_recovered_allocations(
+        &self,
+        allocations: &[NetAlloc],
+    ) -> Result<Vec<NetAlloc>, OrchError> {
         if let Err(error) = self.install_recovery_quarantine(allocations) {
             return Err(self.recovery_failure_after_emergency_isolation(
                 allocations,
@@ -647,7 +659,63 @@ impl NetProvisioner {
             }
         }
 
+        // A recovered policy whose TAP no longer exists is stale, not
+        // dangerous: it means the interface is gone (most commonly a host
+        // reboot, which wipes every TAP), not that programming it failed.
+        // tarit#30 bug 2: taritd used to treat "no such interface" exactly
+        // like "policy exists but could not be applied" and refuse to start
+        // at all, restarting every 5s under systemd forever (NRestarts in
+        // the thousands, taritd never came up). Free the slot instead and
+        // keep starting; only a TAP that *does* exist but still fails to
+        // program is the case fail-closed exists to catch.
+        let mut still_owned_allocations = Vec::with_capacity(allocations.len());
         for alloc in allocations {
+            match strict_tap_is_absent(&alloc.tap) {
+                Ok(true) => {
+                    tracing::warn!(
+                        tap = %alloc.tap,
+                        vm_id = %alloc.vm_id,
+                        slot = alloc.idx,
+                        "net: recovered policy for VM {} refers to TAP {} which no longer \
+                         exists; treating as stale from a host reboot and freeing the slot \
+                         instead of failing closed",
+                        alloc.vm_id,
+                        alloc.tap
+                    );
+                    if let Err(error) = self.teardown_locked(alloc) {
+                        return Err(self.recovery_failure_after_cleanup(
+                            allocations,
+                            "free stale recovered allocation with missing TAP",
+                            error,
+                        ));
+                    }
+                    // Release this allocation's recovery quarantine now,
+                    // rather than waiting for the batch release at the end
+                    // of `NetProvisioner::new`: the slot is already freed,
+                    // so a still-present quarantine rule for it would read
+                    // as "policy for an inactive allocation" to the closed-
+                    // ownership revalidation that runs before that batch
+                    // release ever gets a chance to run.
+                    if let Err(error) =
+                        self.delete_recovery_quarantine_atomically(std::slice::from_ref(alloc))
+                    {
+                        return Err(self.recovery_failure_after_cleanup(
+                            allocations,
+                            "release quarantine for freed stale recovered allocation",
+                            error,
+                        ));
+                    }
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(self.recovery_failure_after_cleanup(
+                        allocations,
+                        "check whether recovered allocation's TAP still exists",
+                        error,
+                    ));
+                }
+            }
             if let Err(error) = self.program_recovered_allocation(alloc) {
                 return Err(self.recovery_failure_after_cleanup(
                     allocations,
@@ -662,6 +730,7 @@ impl NetProvisioner {
                     error,
                 ));
             }
+            still_owned_allocations.push(alloc.clone());
         }
 
         let report = match self.sweep_orphans() {
@@ -689,14 +758,17 @@ impl NetProvisioner {
                 error,
             ));
         }
-        self.raise_recovered_allocations(allocations)
+        // Only raise TAPs we actually still own: a stale allocation was
+        // already freed above, and its TAP does not exist to raise.
+        self.raise_recovered_allocations(&still_owned_allocations)
             .map_err(|error| {
                 self.recovery_failure_after_cleanup(
                     allocations,
                     "raise recovered allocations under quarantine",
                     error,
                 )
-            })
+            })?;
+        Ok(still_owned_allocations)
     }
 
     fn install_recovery_quarantine(&self, allocations: &[NetAlloc]) -> Result<(), OrchError> {
@@ -4947,7 +5019,7 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
 case "${0##*/}:$*" in
   "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
   "ip:-o link show") echo "7: insta7: <BROADCAST,UP> mtu 1500" ;;
-  "ip:-j link show") echo '[]' ;;
+  "ip:-j link show") echo '[{"ifname":"insta7"}]' ;;
   "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
   "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
   "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
@@ -5071,8 +5143,19 @@ esac
         assert!(quarantine_release.contains("delete rule ip taritd_nat vm_egress handle"));
         assert!(quarantine_release.contains("delete rule ip taritd_nat vm_input handle"));
         assert!(!commands.contains("ip tuntap add dev insta7 mode tap"));
+        // `insta7` genuinely exists in this scenario (tarit#30 bug 2's
+        // `strict_tap_is_absent` check needs that to be true), so
+        // `startup_preflight` now isolates it defensively *before* the nft
+        // table/quarantine even exist -- an earlier, stronger form of
+        // containment than the quarantine rule. What this assertion cares
+        // about is narrower: that reconciliation's own isolate-down (the one
+        // paired with quarantine installation) still happens no earlier than
+        // that quarantine install, so look for it after that point rather
+        // than at the first "down" in the whole log.
+        let quarantine_install_offset = commands.find("nft -f -").unwrap();
         assert!(
-            commands.find("nft -f -").unwrap() < commands.find("ip link set insta7 down").unwrap()
+            commands[quarantine_install_offset..].contains("ip link set insta7 down"),
+            "{commands}"
         );
         assert!(
             commands
@@ -5284,6 +5367,129 @@ esac
             "{error}"
         );
         assert!(!commands.contains("ip link set insta7 up"), "{commands}");
+    }
+
+    #[test]
+    fn recovered_allocation_with_missing_tap_is_freed_instead_of_blocking_startup() {
+        // Regression test for the 2026-08-05 production incident (tarit#30
+        // bug 2): after a host reboot, no TAP devices exist at all, but the
+        // persisted network state (and the caller's live-VM list) still
+        // point at a VM whose TAP was never re-created. taritd used to treat
+        // the resulting ENOENT from programming that TAP's sysctl settings
+        // as a fatal fail-closed error, refusing to start at all -- and
+        // since systemd restarts it every 5s, it never came up again
+        // (NRestarts in the thousands). A recovered policy whose TAP is
+        // simply gone is stale, not dangerous: startup must free the slot,
+        // warn, and complete successfully.
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-recovery-missing-tap-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let fake_state = root.join("fake-state");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &state_path,
+            format!(
+                r#"{{"version":2,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7","egress":{{"allowlist":[],"allow_existing":false}}}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        // Nothing exists on this "host": no TAPs at all (`-j`/`-o link
+        // show` both empty), matching a clean reboot. `link set ... down`
+        // reproduces iproute2's real ENODEV text so it is contained as
+        // "already gone" rather than a real isolation failure.
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
+  "ip:-j link show") echo '[]' ;;
+  "ip:-o link show") : ;;
+  "ip:link set insta7 down") echo "Cannot find device \"insta7\"" >&2; exit 1 ;;
+  "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-a list chain ip taritd_nat vm_egress")
+    [ ! -e "$TARIT_TEST_FAKE_STATE.quarantine" ] || echo "iifname \"insta7\" drop comment \"taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 20"
+    ;;
+  "nft:-a list chain ip taritd_nat vm_input")
+    [ ! -e "$TARIT_TEST_FAKE_STATE.quarantine" ] || echo "iifname \"insta7\" drop comment \"taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 21"
+    ;;
+  "nft:-f -")
+    script=$(cat)
+    case "$script" in
+      *"insert rule ip taritd_nat vm_egress"*)
+        touch "$TARIT_TEST_FAKE_STATE.quarantine"
+        ;;
+      *"delete rule ip taritd_nat vm_egress handle "*)
+        rm -f "$TARIT_TEST_FAKE_STATE.quarantine"
+        ;;
+      *) echo "unexpected nft transaction: $script" >&2; exit 1 ;;
+    esac
+    ;;
+esac
+"#;
+        for name in ["ip", "nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_FAKE_STATE", &fake_state);
+        std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
+        let result = NetProvisioner::new(state_path.clone(), [vm_id]);
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+        std::env::remove_var("TARIT_TEST_FAKE_STATE");
+        std::env::remove_var("TARIT_TEST_VM_ID");
+
+        result.expect("startup must succeed when a recovered TAP is merely gone, not fail-closed");
+        let commands = std::fs::read_to_string(&log).unwrap();
+        let persisted = std::fs::read_to_string(&state_path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        // The whole point of the fix: no fatal sysctl attempt against the
+        // vanished TAP, and the slot was actually freed from persisted
+        // state (not just skipped in memory), so a future VM can reuse it.
+        assert!(
+            !commands.contains("sysctl -qw net.ipv6.conf.insta7"),
+            "must never attempt to program a TAP that does not exist: {commands}"
+        );
+        assert!(
+            !persisted.contains(&vm_id.to_string()),
+            "the stale allocation must be freed from persisted state: {persisted}"
+        );
     }
 
     #[test]
@@ -5614,7 +5820,7 @@ case "${0##*/}:$*" in
   "ip:link set insta7 up") touch "$TARIT_TEST_FAKE_STATE.insta7.up"; rm -f "$TARIT_TEST_FAKE_STATE.insta7.down" ;;
   "ip:link set insta8 down") touch "$TARIT_TEST_FAKE_STATE.insta8.down"; rm -f "$TARIT_TEST_FAKE_STATE.insta8.up" ;;
   "ip:link set insta8 up") touch "$TARIT_TEST_FAKE_STATE.insta8.up"; rm -f "$TARIT_TEST_FAKE_STATE.insta8.down" ;;
-  "ip:-j link show") echo '[]' ;;
+  "ip:-j link show") echo '[{"ifname":"insta7"},{"ifname":"insta8"}]' ;;
   "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
   "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
   "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
@@ -5788,7 +5994,7 @@ esac
 printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
 case "${0##*/}:$*" in
   "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
-  "ip:-j link show") echo '[]' ;;
+  "ip:-j link show") echo '[{"ifname":"insta7"}]' ;;
   "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
   "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
   "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
@@ -5841,9 +6047,15 @@ esac
         assert!(fake_state.with_extension("guard-cleaned").exists());
         assert!(fake_state.with_extension("ingress-cleaned").exists());
         std::fs::remove_dir_all(&root).unwrap();
+        // 3, not 2: `insta7` genuinely exists in this scenario (tarit#30 bug
+        // 2's `strict_tap_is_absent` check needs that to be true), so
+        // `startup_preflight` now isolates it once defensively before
+        // reconciliation even starts, in addition to reconciliation's own
+        // isolate-down and the emergency containment down triggered by the
+        // partial-policy failure this test exercises.
         assert_eq!(
             commands.matches("ip link set insta7 down").count(),
-            2,
+            3,
             "{commands}"
         );
         assert!(!commands.contains("ip link set insta7 up"), "{commands}");
