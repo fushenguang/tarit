@@ -68,6 +68,15 @@ struct ServeCgroupArgs {
     #[arg(long, value_name = "BYTES", value_parser = parse_human_bytes, requires = "cgroup")]
     cgroup_memory_max: Option<u64>,
 
+    /// memory.high soft-throttle threshold for the served VM process (bytes,
+    /// or K/M/G/T suffix). Gives the kernel headroom below memory.max to
+    /// reclaim in the background instead of synchronously in the vCPU
+    /// thread; without it, all reclaim is direct reclaim on whichever thread
+    /// touched the page (see vmm-jailer's `CgroupLimits::memory_high` doc and
+    /// tarit#28). Only meaningful alongside a memory.max, so it requires one.
+    #[arg(long, value_name = "BYTES", value_parser = parse_human_bytes, requires = "cgroup_memory_max")]
+    cgroup_memory_high: Option<u64>,
+
     /// cpu.max limit as QUOTA/PERIOD (microseconds) or millicpu, e.g. 1000m.
     #[arg(long, value_name = "QUOTA/PERIOD|MILLICPU", value_parser = parse_cgroup_cpu_max, requires = "cgroup")]
     cgroup_cpu_max: Option<String>,
@@ -87,6 +96,7 @@ impl ServeCgroupArgs {
             cpu_max: self.cgroup_cpu_max.clone(),
             cpuset_cpus: self.cpuset.clone(),
             memory_max: self.cgroup_memory_max,
+            memory_high: self.cgroup_memory_high,
             pids_max: self.cgroup_pids_max,
             ..Default::default()
         };
@@ -1558,5 +1568,58 @@ mod tests {
     #[test]
     fn serve_cgroup_limit_flags_require_cgroup_path() {
         assert!(Cli::try_parse_from(["vmm", "serve", "--cgroup-memory-max", "512M",]).is_err());
+    }
+
+    // --- memory.high (tarit#28 follow-up: give the kernel soft-reclaim
+    // headroom below memory.max, see cgroups.rs `memory_high` for the
+    // rationale) -------------------------------------------------------
+
+    #[test]
+    fn serve_cgroup_flags_build_limits_with_memory_high() {
+        let cli = Cli::try_parse_from([
+            "vmm",
+            "serve",
+            "--cgroup",
+            "/sys/fs/cgroup/vmm-test",
+            "--cgroup-memory-max",
+            "512M",
+            "--cgroup-memory-high",
+            "460M",
+        ])
+        .unwrap();
+
+        match cli.cmd {
+            Cmd::Serve { cgroup, .. } => {
+                assert_eq!(
+                    cgroup.limits(),
+                    Some(vmm_jailer::cgroups::CgroupLimits {
+                        memory_max: Some(536_870_912),
+                        memory_high: Some(482_344_960),
+                        ..Default::default()
+                    })
+                );
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn serve_cgroup_memory_high_requires_cgroup_path() {
+        assert!(Cli::try_parse_from(["vmm", "serve", "--cgroup-memory-high", "460M",]).is_err());
+    }
+
+    #[test]
+    fn serve_cgroup_memory_high_requires_memory_max() {
+        // memory.high without memory.max makes no sense: if the caller never
+        // set a hard ceiling there is no ceiling to leave headroom under.
+        assert!(Cli::try_parse_from([
+            "vmm",
+            "serve",
+            "--cgroup",
+            "/sys/fs/cgroup/vmm-test",
+            "--cgroup-memory-high",
+            "460M",
+        ])
+        .is_err());
     }
 }
