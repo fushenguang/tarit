@@ -294,10 +294,15 @@ impl server::Handler for GatewayHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.channels.insert(channel.id(), ChannelState::default());
-        Ok(true)
+        // russh 0.62 replaced the bool return with an explicit handle:
+        // accept() must be called, otherwise dropping the handle replies
+        // with AdministrativelyProhibited.
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(
