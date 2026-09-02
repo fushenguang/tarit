@@ -50,6 +50,72 @@ const HOST_READ_CHUNK: usize = 4096;
 const HOST_EPHEMERAL_PORT_START: u32 = 49152;
 const HOST_EPHEMERAL_PORT_END: u32 = 65535;
 
+/// Livelock instrumentation for fushenguang/tarit#39 (diagnostic patch,
+/// temporary). One JSON-ish summary line per second via `maybe_report`,
+/// driven from the hot paths themselves (RX/TX queue processing). Counters
+/// are process-lifetime atomics; the report is rate-limited so a 90kHz loop
+/// cannot turn the log into its own DoS.
+mod diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub static RX_PROCESSED: AtomicU64 = AtomicU64::new(0);
+    pub static TX_PROCESSED: AtomicU64 = AtomicU64::new(0);
+    pub static IRQ: AtomicU64 = AtomicU64::new(0);
+    pub static NOTIFY_RX: AtomicU64 = AtomicU64::new(0);
+    pub static NOTIFY_TX: AtomicU64 = AtomicU64::new(0);
+    // enqueue_rx by op
+    pub static ENQ_REQUEST: AtomicU64 = AtomicU64::new(0);
+    pub static ENQ_RESPONSE: AtomicU64 = AtomicU64::new(0);
+    pub static ENQ_RW: AtomicU64 = AtomicU64::new(0);
+    pub static ENQ_CREDIT_UPDATE: AtomicU64 = AtomicU64::new(0);
+    pub static ENQ_CREDIT_REQUEST: AtomicU64 = AtomicU64::new(0);
+    pub static ENQ_SHUTDOWN: AtomicU64 = AtomicU64::new(0);
+    pub static ENQ_RST: AtomicU64 = AtomicU64::new(0);
+    pub static ENQ_OTHER: AtomicU64 = AtomicU64::new(0);
+    // The three Some(0) early-exits inside the RX callback (packet left on
+    // pending_rx, chain still marked complete) plus the pending-empty break.
+    // These are the candidate fuels of the interrupt-driven livelock.
+    pub static RX_CAP_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+    pub static RX_CAP_SHORT: AtomicU64 = AtomicU64::new(0);
+    pub static RX_WRITE_FAIL: AtomicU64 = AtomicU64::new(0);
+    pub static RX_PENDING_EMPTY: AtomicU64 = AtomicU64::new(0);
+
+    static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Print one summary line at most once per second. Callers pass the
+    /// current pending_rx depth (device-side state, not visible here).
+    pub fn maybe_report(pending: usize) {
+        let now = now_ms();
+        let last = LAST_REPORT_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 1000 {
+            return;
+        }
+        if LAST_REPORT_MS
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let r = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        log::info!(
+            "vsock-diag: rx={} tx={} irq={} notify_rx={} notify_tx={} enq(req={},rsp={},rw={},cu={},cr={},sd={},rst={},other={}) zero(capovf={},capshort={},wfail={}) empty={} pending={}",
+            r(&RX_PROCESSED), r(&TX_PROCESSED), r(&IRQ), r(&NOTIFY_RX), r(&NOTIFY_TX),
+            r(&ENQ_REQUEST), r(&ENQ_RESPONSE), r(&ENQ_RW), r(&ENQ_CREDIT_UPDATE),
+            r(&ENQ_CREDIT_REQUEST), r(&ENQ_SHUTDOWN), r(&ENQ_RST), r(&ENQ_OTHER),
+            r(&RX_CAP_OVERFLOW), r(&RX_CAP_SHORT), r(&RX_WRITE_FAIL),
+            r(&RX_PENDING_EMPTY), pending
+        );
+    }
+}
+
 pub mod packet_type {
     pub const STREAM: u16 = 1;
 }
@@ -495,6 +561,7 @@ impl VirtioVsockMmio {
     }
 
     fn trigger_interrupt(&self) {
+        diag::IRQ.fetch_add(1, Ordering::Relaxed);
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
         #[cfg(target_os = "linux")]
@@ -582,10 +649,12 @@ impl VirtioVsockMmio {
                 Some(0)
             });
 
+        diag::TX_PROCESSED.fetch_add(processed as u64, Ordering::Relaxed);
         if processed > 0 {
             self.trigger_interrupt();
             self.process_rx_queue();
         }
+        diag::maybe_report(self.pending_rx.lock().unwrap().len());
         processed
     }
 
@@ -624,19 +693,25 @@ impl VirtioVsockMmio {
             .process_queue_descriptors_dirty(&mem, dirty.as_ref(), |_readable, writable| {
                 let packet = match self.pending_rx.lock().unwrap().front().cloned() {
                     Some(packet) => packet,
-                    None => return None,
+                    None => {
+                        diag::RX_PENDING_EMPTY.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
                 };
                 let bytes = packet.to_bytes();
                 let Some(cap) = writable
                     .iter()
                     .try_fold(0usize, |acc, (_, len)| acc.checked_add(*len as usize))
                 else {
+                    diag::RX_CAP_OVERFLOW.fetch_add(1, Ordering::Relaxed);
                     return Some(0);
                 };
                 if cap < bytes.len() {
+                    diag::RX_CAP_SHORT.fetch_add(1, Ordering::Relaxed);
                     return Some(0);
                 }
                 if !write_desc_chain(&mem, dirty.as_ref(), writable, &bytes) {
+                    diag::RX_WRITE_FAIL.fetch_add(1, Ordering::Relaxed);
                     return Some(0);
                 }
                 self.pending_rx.lock().unwrap().pop_front();
@@ -646,10 +721,12 @@ impl VirtioVsockMmio {
                 Some(bytes.len() as u32)
             });
 
+        diag::RX_PROCESSED.fetch_add(processed as u64, Ordering::Relaxed);
         if processed > 0 {
             self.trigger_interrupt();
         }
         let pending = self.pending_rx.lock().unwrap().len();
+        diag::maybe_report(pending);
         if pending > 0 {
             log::debug!(
                 "vsock rx: delivered {processed}, still {pending} pending (RX bufs short?)"
@@ -715,6 +792,17 @@ impl VirtioVsockMmio {
     }
 
     fn enqueue_rx(&self, packet: VsockPacket) {
+        match packet.header.op {
+            op::REQUEST => &diag::ENQ_REQUEST,
+            op::RESPONSE => &diag::ENQ_RESPONSE,
+            op::RW => &diag::ENQ_RW,
+            op::CREDIT_UPDATE => &diag::ENQ_CREDIT_UPDATE,
+            op::CREDIT_REQUEST => &diag::ENQ_CREDIT_REQUEST,
+            op::SHUTDOWN => &diag::ENQ_SHUTDOWN,
+            op::RST => &diag::ENQ_RST,
+            _ => &diag::ENQ_OTHER,
+        }
+        .fetch_add(1, Ordering::Relaxed);
         let mut q = self.pending_rx.lock().unwrap();
         if q.len() >= MAX_PENDING_RX {
             // Backpressure: drop rather than grow without bound. The guest is
@@ -1086,9 +1174,11 @@ impl MmioDevice for VirtioVsockMmio {
                 self.notify_count.fetch_add(1, Ordering::Relaxed);
                 match val as usize {
                     QUEUE_RX => {
+                        diag::NOTIFY_RX.fetch_add(1, Ordering::Relaxed);
                         self.process_rx_queue();
                     }
                     QUEUE_TX => {
+                        diag::NOTIFY_TX.fetch_add(1, Ordering::Relaxed);
                         self.process_tx_queue();
                     }
                     QUEUE_EVENT => {}
