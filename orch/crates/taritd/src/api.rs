@@ -1665,7 +1665,7 @@ async fn delete_vm(
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
     Query(q): Query<DeleteVmQuery>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     match cluster::resolve_owner(&state, id).await? {
         Owner::Local => {
             let vm = ops::get_local(&state, id)?;
@@ -1698,7 +1698,11 @@ async fn delete_vm(
         audit_outcome::OK,
         None,
     );
-    Ok(StatusCode::NO_CONTENT)
+    // tarit#25: a bare DELETE and a ?force=true DELETE both answer 204, which
+    // left the retained-vs-purged split invisible to callers. Keep the status
+    // stable for existing clients; say which one happened in the header.
+    let result = if q.force { "purged" } else { "retained" };
+    Ok((StatusCode::NO_CONTENT, [("x-tarit-result", result)]))
 }
 
 /// Stop a VM's guest process, retaining its overlay disk and record so it
@@ -2909,6 +2913,11 @@ mod tests {
             )
             .await;
             assert_eq!(retained.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                retained.headers().get("x-tarit-result").unwrap(),
+                "retained",
+                "bare DELETE must advertise that the record+overlay are retained (tarit#25)"
+            );
             assert!(
                 state.store.lock().unwrap().get_vm(id).is_ok(),
                 "DELETE without ?force must retain the VM (equivalent to stop)"
@@ -2923,6 +2932,11 @@ mod tests {
             )
             .await;
             assert_eq!(purged.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                purged.headers().get("x-tarit-result").unwrap(),
+                "purged",
+                "?force=true DELETE must advertise that the record+overlay are purged (tarit#25)"
+            );
 
             writer.abort();
         });
