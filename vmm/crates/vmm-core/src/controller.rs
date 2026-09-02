@@ -1383,7 +1383,11 @@ impl VmmController {
             if let Some(vx) = vsock_channel {
                 match vx.exec(command, timeout) {
                     Some(Ok(r)) => {
-                        log::info!("exec '{command}' via vsock → exit={}", r.0);
+                        log::info!(
+                            "exec '{}' via vsock → exit={}",
+                            redact_for_log(command),
+                            r.0
+                        );
                         return Ok(r);
                     }
                     Some(Err(crate::vsock_exec::VsockExecError::NotDelivered(e))) => {
@@ -1497,7 +1501,10 @@ impl VmmController {
                         let exit_code: i32 = code.trim().parse().unwrap_or(0);
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let output_str = finish_exec_output(output, truncated);
-                        log::info!("exec: '{command}' → exit={exit_code} {duration_ms}ms");
+                        log::info!(
+                            "exec: '{}' → exit={exit_code} {duration_ms}ms",
+                            redact_for_log(command)
+                        );
                         return Ok((exit_code, output_str, duration_ms));
                     }
                     if confirmed {
@@ -1600,7 +1607,10 @@ impl VmmController {
         vm.run_vcpu(&mut vcpu)?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        log::info!("exec (fresh boot): '{command}' → {duration_ms}ms");
+        log::info!(
+            "exec (fresh boot): '{}' → {duration_ms}ms",
+            redact_for_log(command)
+        );
         Ok((0, String::new(), duration_ms))
     }
 
@@ -4029,6 +4039,190 @@ fn serialize_state_blob(
     postcard::to_allocvec(&blob).unwrap_or_default()
 }
 
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+/// Mask one credential-shaped token run, keeping enough context to
+/// correlate log lines without keeping the secret: first 4 + last 4
+/// characters for long runs, `***` for short ones.
+fn mask_secret_run(run: &str) -> String {
+    let chars: Vec<char> = run.chars().collect();
+    if chars.len() >= 12 {
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}…{tail}")
+    } else {
+        "***".to_string()
+    }
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+/// Credential token prefixes worth masking wherever they appear, and
+/// assignment-keyword stems whose following value is a secret. All matching
+/// is ASCII and case-insensitive; command lines are overwhelmingly ASCII.
+const SECRET_TOKEN_PREFIXES: &[&str] = &["sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-", "xoxa-"];
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+const SECRET_KEYWORD_STEMS: &[&str] = &[
+    "bearer",
+    "authorization",
+    "token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "password",
+    "secret",
+    "client_secret",
+];
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'/' | b'+' | b'-' | b'=')
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+fn token_run_end(input: &str, from: usize) -> usize {
+    let bytes = input.as_bytes();
+    let mut end = from;
+    while end < bytes.len() && is_token_byte(bytes[end]) {
+        end += 1;
+    }
+    end
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+/// Does the text immediately preceding a token run end with one of the
+/// secret keyword stems, separated from the run only by `=`, `:` or spaces?
+fn preceded_by_secret_keyword(lowercased_before: &str) -> bool {
+    let trimmed = lower_before_trimmed(lowercased_before);
+    SECRET_KEYWORD_STEMS.iter().any(|stem| {
+        if !trimmed.ends_with(stem) {
+            return false;
+        }
+        let at = trimmed.len() - stem.len();
+        at == 0 || {
+            let previous = trimmed.as_bytes()[at - 1];
+            !(previous.is_ascii_alphanumeric() || previous == b'_' || previous == b'-')
+        }
+    })
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+/// If the token run is shaped `keyword=value` where `keyword` *ends with*
+/// one of the secret stems (`api_key=ghp_…`, `AUTH_TOKEN=xyz…`, `password=…`),
+/// return the byte offset of the `=` + 1. Values shorter than 8 bytes are
+/// left alone (they look like flags, not secrets).
+fn assignment_value_start(run: &str, run_lower: &str) -> Option<usize> {
+    let equals = run.find('=')?;
+    let keyword = &run_lower[..equals];
+    let value_len = run.len() - equals - 1;
+    if value_len < 8 {
+        return None;
+    }
+    let is_keyword = SECRET_KEYWORD_STEMS.iter().any(|stem| {
+        keyword.ends_with(stem) && {
+            let at = keyword.len() - stem.len();
+            at == 0 || !keyword.as_bytes()[at - 1].is_ascii_alphanumeric()
+        }
+    });
+    if is_keyword {
+        Some(equals + 1)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+fn lower_before_trimmed(lowercased_before: &str) -> &str {
+    lowercased_before.trim_end_matches([' ', '=', ':', '\t'])
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot"),
+    test
+))]
+/// Redact credential-shaped substrings from an exec command before it is
+/// logged (tarit#42). Workload command lines routinely carry provider keys
+/// (`curl -H "Authorization: Bearer sk-..."`, env dumps, config cats), and
+/// vmm's log output is inherited by taritd into the host journal. Known
+/// shapes are masked to first4…last4; anything unrecognized still passes
+/// through (this is best-effort, not a DLP boundary), and the result is
+/// capped so a long command cannot double as an output dump.
+///
+/// The input is walked as an alternating sequence of token runs and
+/// everything-else, so spans can never overlap or interleave — a value that
+/// itself contains a keyword (`AUTH_TOKEN=xyzfidelitytoken9876`) is judged
+/// once, as a whole run, by what precedes it.
+fn redact_for_log(input: &str) -> String {
+    const MAX_LOG_LEN: usize = 160;
+    let bytes = input.as_bytes();
+    let lower = input.to_ascii_lowercase();
+    let mut result = String::with_capacity(input.len().min(MAX_LOG_LEN + 16));
+    let mut index = 0;
+    while index < bytes.len() {
+        if !is_token_byte(bytes[index]) {
+            // Copy one UTF-8 character (token bytes are all ASCII, so any
+            // non-token position still needs char-boundary care).
+            let mut end = index + 1;
+            while end < bytes.len() && !input.is_char_boundary(end) {
+                end += 1;
+            }
+            result.push_str(&input[index..end]);
+            index = end;
+            continue;
+        }
+        let run_end = token_run_end(input, index);
+        let run = &input[index..run_end];
+        let is_prefixed = run.len() >= 12
+            && SECRET_TOKEN_PREFIXES
+                .iter()
+                .any(|prefix| lower[index..].starts_with(prefix));
+        let is_assigned = run.len() >= 8 && preceded_by_secret_keyword(&lower[..index]);
+        if let Some(value_start) = assignment_value_start(run, &lower[index..run_end]) {
+            // `keyword=value` inside one run: keep the keyword, mask the value.
+            result.push_str(&run[..value_start]);
+            result.push_str(&mask_secret_run(&run[value_start..]));
+        } else if is_prefixed || is_assigned {
+            result.push_str(&mask_secret_run(run));
+        } else {
+            result.push_str(run);
+        }
+        index = run_end;
+    }
+
+    if result.len() > MAX_LOG_LEN {
+        let mut cut = MAX_LOG_LEN;
+        while cut > 0 && !result.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        result.truncate(cut);
+        result.push_str(&format!("…({} bytes)", input.len()));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4682,5 +4876,60 @@ mod tests {
 
         let _ = std::fs::remove_file(base_s);
         let _ = std::fs::remove_file(diff_s);
+    }
+
+    #[test]
+    fn redact_for_log_masks_known_credential_shapes() {
+        let cases = [
+            (
+                "curl -H \"Authorization: Bearer sk-abcdef1234567890wxyz\" https://api",
+                "sk-a…wxyz",
+            ),
+            ("export API_KEY=ghp_16charsecret12", "ghp_…et12"),
+            ("echo sk-abcdefghijklmnop", "sk-a…mnop"),
+            ("AUTH_TOKEN=xyzfidelitytoken9876 curl x", "xyzf…9876"),
+            ("openai api-key=sk-proj-999888777666", "sk-p…7666"),
+        ];
+        for (input, expect_fragment) in cases {
+            let masked = redact_for_log(input);
+            assert!(
+                masked.contains(expect_fragment),
+                "{masked} should contain {expect_fragment}"
+            );
+            assert!(
+                !masked.contains("1234567890wxyz")
+                    && !masked.contains("16charsecret12")
+                    && !masked.contains("abcdefghijklmnop")
+                    && !masked.contains("fidelitytoken")
+                    && !masked.contains("999888777666"),
+                "{masked} leaked a secret"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_for_log_leaves_ordinary_commands_alone() {
+        assert_eq!(
+            redact_for_log("sh -c 'ls -la /var/log && journalctl -n 5'"),
+            "sh -c 'ls -la /var/log && journalctl -n 5'"
+        );
+        // Short values after an assignment keyword look like flags, not
+        // secrets: keep them.
+        assert_eq!(redact_for_log("password=short pw"), "password=short pw");
+    }
+
+    #[test]
+    fn redact_for_log_truncates_long_commands() {
+        let long = format!("echo {}", "x".repeat(500));
+        let masked = redact_for_log(&long);
+        assert!(masked.len() < 200, "{masked}");
+        assert!(masked.contains("…(505 bytes)"), "{masked}");
+    }
+
+    #[test]
+    fn redact_for_log_handles_multibyte_without_panicking() {
+        let masked = redact_for_log("echo \"密钥 sk-abcdefgh12345\" && 中文输出");
+        assert!(masked.contains("sk-a…2345"), "{masked}");
+        assert!(masked.contains("中文输出"), "{masked}");
     }
 }
