@@ -309,6 +309,11 @@ pub struct VirtioVsockMmio {
     pub rx_packets: AtomicU64,
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
+    /// Pending packets dropped because the guest's posted RX buffers could
+    /// not accept them (short buffer or unwritable chain). Non-zero on a
+    /// healthy guest means a vsock stream is losing data — see the drop
+    /// sites in `process_rx_queue`.
+    pub rx_dropped: AtomicU64,
 }
 
 impl VirtioVsockMmio {
@@ -344,6 +349,7 @@ impl VirtioVsockMmio {
             rx_packets: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
+            rx_dropped: AtomicU64::new(0),
         }
     }
 
@@ -631,12 +637,38 @@ impl VirtioVsockMmio {
                     .iter()
                     .try_fold(0usize, |acc, (_, len)| acc.checked_add(*len as usize))
                 else {
-                    return Some(0);
+                    // A descriptor chain cannot overflow usize on a 64-bit
+                    // host (queue depth * u32 len stays far below 2^64). If
+                    // it somehow does, leave the chain in-flight rather than
+                    // wedging the queue or dropping data.
+                    return None;
                 };
                 if cap < bytes.len() {
+                    // The guest posted an RX buffer smaller than the packet.
+                    // Consume the buffer and DROP the packet — the vhost-vsock
+                    // policy for short RX buffers. Returning the descriptor
+                    // empty while keeping the packet used to spin forever:
+                    // the guest re-posted the same short buffer, the device
+                    // re-failed the same packet, and the resulting interrupt
+                    // storm pinned a virtio_vsock kworker at ~98% of a vCPU
+                    // from boot (tarit#39).
+                    self.pending_rx.lock().unwrap().pop_front();
+                    self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "vsock rx: dropping {}-byte packet into {}-byte guest RX buffer",
+                        bytes.len(),
+                        cap
+                    );
                     return Some(0);
                 }
                 if !write_desc_chain(&mem, dirty.as_ref(), writable, &bytes) {
+                    // Guest memory rejected the write (bad GPA in the chain).
+                    // Dropping the packet keeps the queue moving for other
+                    // connections; this stream stalls and the failure
+                    // surfaces upstream instead of wedging the device.
+                    self.pending_rx.lock().unwrap().pop_front();
+                    self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                    log::warn!("vsock rx: guest memory write failed; dropping packet");
                     return Some(0);
                 }
                 self.pending_rx.lock().unwrap().pop_front();
@@ -1761,5 +1793,44 @@ mod tests {
             dev.enqueue_rx(guest_packet(GUEST_PORT, op::RST, &[]));
         }
         assert_eq!(dev.pending_rx.lock().unwrap().len(), MAX_PENDING_RX);
+    }
+
+    #[test]
+    fn short_rx_buffer_drops_packet_instead_of_spinning() {
+        // Regression for tarit#39: when the only posted RX buffer is too
+        // small for the pending packet, the old code returned the descriptor
+        // empty WITHOUT popping pending_rx — the guest saw a zero-length
+        // completion, reposted the same short buffer, and the device retried
+        // the same oversized packet forever. That self-sustaining loop pinned
+        // a virtio_vsock kworker at ~98% of a vCPU from boot.
+        let mem = new_mem();
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let _rx_bufs = setup_queues(&dev, &mem, 1);
+        // Shrink the only RX descriptor below the packet size: 32 bytes
+        // cannot hold the 44-byte vsock header alone.
+        mem.write_obj(
+            Descriptor {
+                addr: RX_BUF,
+                len: 32,
+                flags: desc_flags::WRITE,
+                next: 0,
+            },
+            GuestAddress(RX_DESC),
+        )
+        .unwrap();
+        // 64 bytes of payload make the packet (header + data) unable to fit
+        // the 32-byte buffer.
+        dev.enqueue_rx(guest_packet(GUEST_PORT, op::RW, &[0u8; 64]));
+        assert_eq!(dev.pending_rx.lock().unwrap().len(), 1);
+
+        let processed = dev.process_rx_queue();
+        // The short buffer must be consumed and the packet dropped (vhost
+        // semantics), so the loop cannot sustain itself.
+        assert_eq!(processed, 1);
+        assert_eq!(dev.rx_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(dev.pending_rx.lock().unwrap().len(), 0);
+        // Nothing left to deliver: a second pass is a no-op instead of
+        // re-failing the same packet against the same reposted buffer.
+        assert_eq!(dev.process_rx_queue(), 0);
     }
 }
