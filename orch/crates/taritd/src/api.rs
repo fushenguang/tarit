@@ -228,6 +228,10 @@ pub struct AppState {
     /// When both are needed, this gate is acquired before the supervisor boot
     /// gate; boot publication never acquires this gate.
     pub(crate) terminal_transition_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Per-VM timestamp of the last automatic restart after an unexpected
+    /// VMM exit (tarit#40). A second exit inside the backoff window is
+    /// treated as a crash loop and left Error instead of hot-looping boots.
+    pub(crate) restart_backoff: Arc<Mutex<HashMap<Uuid, std::time::Instant>>>,
     /// Durable audit outbox used by lifecycle operations that cannot rely on
     /// the best-effort background writer.
     pub(crate) audit_outbox: Arc<dyn audit::DurableAuditOutbox>,
@@ -4062,6 +4066,7 @@ mod tests {
                 lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
                 terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
+                restart_backoff: Arc::new(Mutex::new(HashMap::new())),
                 pty_registry: Arc::new(PtyRegistry::default()),
                 supervisor: Arc::new(VmmSupervisor::new(config.clone())),
                 scheduler: Arc::new(Scheduler::new(config)),

@@ -2578,10 +2578,23 @@ impl VmmSupervisor {
         )
         .map_err(|error| match error {
             ReadinessWaitError::Cancelled(error) => error,
-            ReadinessWaitError::TimedOut(last) => OrchError::Vmm(format!(
-                "guest agent never became ready at {}: {last}",
-                socket.display()
-            )),
+            ReadinessWaitError::TimedOut(last) => {
+                // tarit#41 health gate: "guest booted" is not "agent channel
+                // healthy". The guest can be fully up (systemd started,
+                // network live, dmesg clean) while nothing ever starts the
+                // exec agent. Say so at WARN level here — before, the only
+                // symptom was exec timeouts noticed a day later, and vmm's
+                // own INFO logs never reach journald.
+                tracing::warn!(
+                    socket = %socket.display(),
+                    last_error = %last,
+                    "guest booted but the exec agent never checked in within the readiness timeout — image agent wiring suspect (tarit#41); exec/PTY will time out until the image is rebuilt"
+                );
+                OrchError::Vmm(format!(
+                    "guest agent never became ready at {}: {last}",
+                    socket.display()
+                ))
+            }
         })?;
         self.sync_guest_clock(socket);
         Ok(())
@@ -3348,6 +3361,17 @@ impl VmmSupervisor {
             .get(&id)
             .map(|vm| Arc::clone(&vm.operation_gate))
             .ok_or_else(|| OrchError::NotFound(format!("vm {id} not running")))
+    }
+
+    /// Whether a locally-running vmm is currently registered for `id`. A VM
+    /// whose row says Running but has no local registration is one whose vmm
+    /// died before the exit reconciler converged it (tarit#40) — callers
+    /// reconcile instead of conflicting off a stale pid.
+    pub fn is_running_local(&self, id: Uuid) -> bool {
+        self.running
+            .lock()
+            .map(|running| running.contains_key(&id))
+            .unwrap_or(false)
     }
 
     pub fn stop_vm(&self, id: Uuid) -> Result<(), OrchError> {
@@ -5017,6 +5041,37 @@ mod tests {
         supervisor.stop_vm(id).unwrap();
         assert!(supervisor.scheduler.release(id));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn is_running_local_tracks_supervisor_registration_only() {
+        let supervisor = VmmSupervisor::new(supervisor_config(&PathBuf::from(format!(
+            "target/taritd-supervisor-isrunning-{}",
+            Uuid::new_v4()
+        ))));
+        let id = Uuid::new_v4();
+        assert!(
+            !supervisor.is_running_local(id),
+            "an unregistered VM reports not-running regardless of its row status"
+        );
+        let process = ManagedProcess::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn test process"),
+        );
+        supervisor.running.lock().unwrap().insert(
+            id,
+            RunningVm::new(
+                process.pid,
+                PathBuf::from("target/unused.sock"),
+                process,
+                None,
+            ),
+        );
+        assert!(supervisor.is_running_local(id));
+        supervisor.running.lock().unwrap().remove(&id);
+        assert!(!supervisor.is_running_local(id));
     }
 
     #[test]

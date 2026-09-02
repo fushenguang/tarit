@@ -1613,6 +1613,22 @@ async fn start_local_owned(
 ) -> Result<VmRecord, OrchError> {
     let existing = get_local(state, id)?;
     if existing.status != VmStatus::Stopped {
+        // tarit#40: a Running row with no local vmm registration means the
+        // vmm died and the exit reconciler has not converged it yet. Do NOT
+        // converge from here: start_local already runs inside the owned
+        // lifecycle task, and stop_local's first act is cancel-and-wait on
+        // that same task — self-deadlock. The reconciler owns convergence
+        // (it parks the VM in Stopped or restarts it within one 200ms pass),
+        // so surface the exact situation instead of a bare conflict.
+        if existing.status == VmStatus::Running && !state.supervisor.is_running_local(id) {
+            tracing::warn!(
+                vm = %id,
+                "start: recorded as Running with no live local vmm; exit reconciler convergence pending"
+            );
+            return Err(OrchError::Conflict(format!(
+                "vm {id} is recorded as Running but its vmm is gone; the exit reconciler is converging it — retry the start in a moment (if this persists, the reconciler heartbeat is erroring; tarit#40)"
+            )));
+        }
         return Err(OrchError::Conflict(format!(
             "vm {id} is not stopped (status: {:?})",
             existing.status
@@ -1795,10 +1811,56 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
         return failures;
     }
     let _terminal_gate = state.terminal_transition_gate.lock().await;
+    let mut restarts = Vec::new();
     for exit in exits {
         if let Some(cleanup_error) = &exit.cleanup_error {
             tracing::error!(vm = %exit.id, pid = exit.pid, %cleanup_error, "dead VMM left resources requiring operator reconciliation");
         }
+        // tarit#40: an always-policy VM that died unexpectedly is converged
+        // to Stopped (mirroring an operator stop) and queued for restart
+        // below, instead of being parked in Error with its restart_policy
+        // silently ignored. The restart itself runs outside the terminal
+        // gate — start_local's failure path takes that gate and would
+        // otherwise deadlock. A second death inside the backoff window is
+        // treated as a crash loop and left Error so a wedged VM cannot
+        // hot-loop vmm boots against the scheduler.
+        let throttled = state
+            .restart_backoff
+            .lock()
+            .map(|backoff| {
+                backoff
+                    .get(&exit.id)
+                    .is_some_and(|last| last.elapsed() < UNEXPECTED_EXIT_RESTART_BACKOFF)
+            })
+            .unwrap_or(false);
+        let restart = !throttled
+            && vm_get(state, exit.id).is_ok_and(|record| {
+                record.status == VmStatus::Running
+                    && record.restart_policy == RestartPolicy::Always
+                    && record.host_id == state.config.host_id
+            });
+        let target_status = if restart {
+            tracing::warn!(
+                vm = %exit.id,
+                pid = exit.pid,
+                %exit.status,
+                "VMM exited unexpectedly; restart_policy=always, restarting"
+            );
+            if let Ok(mut backoff) = state.restart_backoff.lock() {
+                backoff.insert(exit.id, std::time::Instant::now());
+            }
+            VmStatus::Stopped
+        } else if throttled {
+            tracing::warn!(
+                vm = %exit.id,
+                pid = exit.pid,
+                %exit.status,
+                "VMM exited again within the backoff window; crash-loop assumed, left in error"
+            );
+            VmStatus::Error
+        } else {
+            VmStatus::Error
+        };
         let result = async {
             if matches!(
                 lifecycle_state(state, exit.id)?,
@@ -1807,7 +1869,7 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
                 finish_publication(state, exit.id).await?;
             }
             crate::usage::meter_vm_final(state, exit.id);
-            start_terminal_transition(state, exit.id, VmStatus::Error, false)?;
+            start_terminal_transition(state, exit.id, target_status, false)?;
             finish_terminal_transition(state, exit.id).await
         }
         .await;
@@ -1816,10 +1878,38 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
                 "VM {} exited ({}) but durable reconciliation failed: {error}",
                 exit.id, exit.status
             ));
+            continue;
+        }
+        if restart {
+            restarts.push(exit);
+        }
+    }
+    drop(_terminal_gate);
+    for exit in restarts {
+        match start_local(state, exit.id).await {
+            Ok(_) => tracing::info!(
+                vm = %exit.id,
+                "VMM exit reconciler: restarted per restart_policy=always"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    vm = %exit.id,
+                    %error,
+                    "VMM exit reconciler: restart after unexpected exit failed (left stopped; retry via a manual start)"
+                );
+                failures.push(format!(
+                    "VM {} exited ({}) and automatic restart failed: {error}",
+                    exit.id, exit.status
+                ));
+            }
         }
     }
     failures
 }
+
+/// How long after an unexpected-exit auto-restart a second unexpected exit
+/// is still treated as a crash loop (kept Error) rather than restarted again.
+const UNEXPECTED_EXIT_RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchError> {
     let sup = Arc::clone(&state.supervisor);
@@ -3451,6 +3541,7 @@ mod tests {
                 lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
                 terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
+                restart_backoff: Arc::new(Mutex::new(HashMap::new())),
                 pty_registry: Arc::new(PtyRegistry::default()),
                 supervisor,
                 scheduler,

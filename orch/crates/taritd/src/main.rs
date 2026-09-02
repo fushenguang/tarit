@@ -29,6 +29,7 @@ use peer::PeerClient;
 use scheduler::Scheduler;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use supervisor::VmmSupervisor;
@@ -320,6 +321,7 @@ async fn run_server(
         #[cfg(test)]
         lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
         terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
+        restart_backoff: Arc::new(Mutex::new(HashMap::new())),
         pty_registry: Arc::new(pty::PtyRegistry::new(pty_limits)),
         supervisor: Arc::clone(&supervisor),
         scheduler: scheduler.clone(),
@@ -422,6 +424,30 @@ fn spawn_vm_exit_reconciler(
     state: AppState,
     shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) -> JoinHandle<()> {
+    // Production 2026-09-02: a vmm child died and this reconciler logged
+    // nothing for the next nine minutes — with a silent loop you cannot
+    // tell "nothing exited" from "the watcher itself is dead". The
+    // heartbeat lets a sidecar task tell those apart (tarit#40).
+    let heartbeat = Arc::new(AtomicU64::new(now_unix_ms()));
+    let watch_beat = Arc::clone(&heartbeat);
+    let watch_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(watch_shutdown.clone()) => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+            let last = watch_beat.load(Ordering::Relaxed);
+            let now = now_unix_ms();
+            if now.saturating_sub(last) > 90_000 {
+                tracing::error!(
+                    last_beat_ms_ago = now - last,
+                    "VMM exit reconciler heartbeat stale: the watcher task is wedged or dead while VMs may be dying unwatched (tarit#40)"
+                );
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(200));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -431,11 +457,32 @@ fn spawn_vm_exit_reconciler(
                 _ = wait_for_shutdown(shutdown_rx.clone()) => break,
                 _ = interval.tick() => {}
             }
+            heartbeat.store(now_unix_ms(), Ordering::Relaxed);
+            let pass_started = Instant::now();
             for failure in ops::reconcile_unexpected_vmm_exits(&state).await {
                 tracing::error!(%failure, "unexpected VMM exit reconciliation failed");
             }
+            if pass_started.elapsed() > RECONCILER_STALL_WARN_AFTER {
+                tracing::error!(
+                    elapsed = ?pass_started.elapsed(),
+                    "VMM exit reconciler pass stalled; a wedged reconcile (gate deadlock, blocked scan) is indistinguishable from quiet — this line is how you tell them apart"
+                );
+                heartbeat.store(now_unix_ms(), Ordering::Relaxed);
+            }
         }
     })
+}
+
+/// How long a silent VMM exit reconciler heartbeat gap may last before the
+/// watchdog below assumes the reconciler task died or wedged. Interval is
+/// 200ms, so a gap this size means dozens of missed passes.
+const RECONCILER_STALL_WARN_AFTER: Duration = Duration::from_secs(30);
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 struct ServerListeners {
@@ -1863,6 +1910,7 @@ mod tests {
             lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
             lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
+            restart_backoff: Arc::new(Mutex::new(HashMap::new())),
             pty_registry: Arc::new(pty::PtyRegistry::default()),
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),
             scheduler: Arc::new(Scheduler::new(config)),

@@ -850,6 +850,7 @@ mod tests {
             lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
             lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
+            restart_backoff: Arc::new(Mutex::new(HashMap::new())),
             pty_registry: Arc::new(PtyRegistry::default()),
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),
             scheduler: Arc::new(Scheduler::new(config)),
