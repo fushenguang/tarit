@@ -24,6 +24,14 @@ const EXEC_OUTPUT_TRUNCATED: &[u8] = b"\n[VMM exec output truncated]\n";
 const EXEC_OUTPUT_PAYLOAD_CAP: usize = EXEC_OUTPUT_CAP - EXEC_OUTPUT_TRUNCATED.len();
 const EXEC_ACC_TAIL_CAP: usize = 64 * 1024;
 
+/// The guest agent reads commands line-by-line. Images built before tarit#38
+/// use a fixed 4096-byte line buffer and drop longer lines silently, so an
+/// oversized exec only failed after the full transport timeout with nothing to
+/// show for it. Refuse such commands up front with an actionable error. Bump
+/// this alongside agent images rebaked with the dynamically-grown line buffer
+/// (1 MiB hard cap) — serial and vsock share the limit.
+pub(crate) const GUEST_AGENT_LINE_LIMIT: usize = 4095;
+
 /// A live exec channel over vsock. Holds the accepted guest connection (if the
 /// agent has dialed) and re-accepts on reconnect.
 pub struct VsockExecChannel {
@@ -58,6 +66,7 @@ impl std::fmt::Display for VsockExecError {
 
 /// Internal result of one exec exchange; tells `exec` whether the stream is
 /// still framed correctly or must be dropped so the agent re-dials.
+#[derive(Debug)]
 enum RunExecOutcome {
     /// Clean completion up to `VMM_EXEC_EXIT=`; the stream stays usable.
     Completed((i32, String, u64)),
@@ -210,6 +219,19 @@ fn run_exec(
 ) -> RunExecOutcome {
     let start = Instant::now();
     let msg = format!("VMM_EXEC:{command}\n");
+    // tarit#38: the guest agent's line buffer is bounded; a line past it never
+    // reaches a shell, so sending it would just burn the exec timeout. The
+    // command was not delivered — serial fallback is safe (its pre-check will
+    // produce the same fast error).
+    if msg.len() > GUEST_AGENT_LINE_LIMIT + 1 {
+        return RunExecOutcome::WriteFailed(format!(
+            "command line is {} bytes, over the guest agent's {}-byte line \
+             limit (see tarit#38); rebuild the image with the updated agent \
+             for commands up to 1 MiB, or split the payload into chunks",
+            msg.len() - 1,
+            GUEST_AGENT_LINE_LIMIT
+        ));
+    }
     if let Err(e) = stream
         .write_all(msg.as_bytes())
         .and_then(|_| stream.flush())
@@ -256,6 +278,18 @@ fn run_exec(
                 return RunExecOutcome::Completed((
                     exit_code,
                     output_str,
+                    start.elapsed().as_millis() as u64,
+                ));
+            }
+            if let Some(reason) = s.strip_prefix("VMM_EXEC_ERROR:") {
+                // The agent rejected the line itself (e.g. LINE_TOO_LONG past
+                // its 1 MiB hard cap) — the command never entered a shell and
+                // no exit marker will follow. Report it as a failed exec
+                // instead of waiting out the timeout.
+                let output_str = finish_exec_output(output, truncated);
+                return RunExecOutcome::Completed((
+                    -1,
+                    format!("[vmm-agent rejected the command: {reason}]\n{output_str}"),
                     start.elapsed().as_millis() as u64,
                 ));
             }
@@ -307,4 +341,66 @@ fn finish_exec_output(mut output: Vec<u8>, truncated: bool) -> String {
         output.extend_from_slice(EXEC_OUTPUT_TRUNCATED);
     }
     String::from_utf8_lossy(&output).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive `run_exec` over a socketpair, optionally pre-writing the peer's
+    /// response bytes before the call.
+    fn exec_over_pair(command: &str, reply: Option<&[u8]>) -> RunExecOutcome {
+        let (mut ours, mut peer) = UnixStream::pair().expect("socketpair");
+        if let Some(bytes) = reply {
+            use std::io::Write as _;
+            peer.write_all(bytes).expect("write reply");
+        }
+        // Mirror the accepted-stream setup in `serve`: blocking reads with a
+        // short timeout, so the deadline loop in `run_exec` keeps ticking.
+        ours.set_nonblocking(false).expect("blocking");
+        ours.set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
+        run_exec(&mut ours, command, Duration::from_secs(5), None)
+    }
+
+    #[test]
+    fn oversize_command_is_refused_before_anything_is_sent() {
+        // tarit#38: a line past the agent's buffer limit must fail fast with
+        // the actionable error, not burn the transport timeout.
+        let command = "true".to_string() + &" ".repeat(GUEST_AGENT_LINE_LIMIT);
+        let RunExecOutcome::WriteFailed(err) = exec_over_pair(&command, None) else {
+            panic!("expected WriteFailed for an oversized command");
+        };
+        assert!(
+            err.contains("guest agent's") && err.contains("line limit"),
+            "error should explain the line limit, got: {err}"
+        );
+    }
+
+    #[test]
+    fn command_at_the_limit_is_still_sent() {
+        // "VMM_EXEC:" + command + "\n" exactly one byte over the bare limit.
+        let command = "x".repeat(GUEST_AGENT_LINE_LIMIT - ("VMM_EXEC:".len() + 1));
+        let outcome = exec_over_pair(&command, Some(b"VMM_EXEC_START\nhello\nVMM_EXEC_EXIT=0\n"));
+        let RunExecOutcome::Completed((code, output, _)) = outcome else {
+            panic!("expected Completed, got {outcome:?}");
+        };
+        assert_eq!(code, 0);
+        assert_eq!(output, "hello\n");
+    }
+
+    #[test]
+    fn agent_error_marker_fails_the_exec_instead_of_timing_out() {
+        // tarit#38: the agent's LINE_TOO_LONG rejection must surface as a
+        // completed-with-error exec, not an unexplained timeout.
+        let outcome = exec_over_pair("true", Some(b"VMM_EXEC_ERROR:LINE_TOO_LONG\n"));
+        let RunExecOutcome::Completed((code, output, _)) = outcome else {
+            panic!("expected Completed, got {outcome:?}");
+        };
+        assert_eq!(code, -1);
+        assert!(
+            output.contains("vmm-agent rejected the command: LINE_TOO_LONG"),
+            "output should carry the rejection, got: {output}"
+        );
+    }
 }
