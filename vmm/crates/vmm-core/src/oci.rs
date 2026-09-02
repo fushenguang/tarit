@@ -66,10 +66,29 @@ pub struct OciPullResult {
     pub size_bytes: u64,
     /// Time taken in milliseconds.
     pub elapsed_ms: u64,
-    /// Whether the guest exec agent was injected as the image's init. When
-    /// true the image boots straight to the agent (no init system required),
-    /// which is what makes an app image like `node:20` usable as a microVM.
-    pub agent_init: bool,
+    /// How the guest exec agent was wired into the image, if at all.
+    /// Initless app images (`node:20`) boot straight to the agent as PID 1;
+    /// systemd-bearing images get a `vmm-agent.service` unit instead.
+    pub agent_wiring: Option<AgentWiring>,
+}
+
+/// How the guest exec agent is wired into a converted image (tarit#41).
+///
+/// `Init` replaces `/sbin/init` with a symlink to the agent — the only
+/// option for initless OCI images. `SystemdUnit` installs and enables
+/// `vmm-agent.service` instead, for images that ship a real init: an
+/// in-guest `apt install/upgrade systemd-sysv` can replace the `/sbin/init`
+/// symlink, and the next reboot then execs systemd as PID 1 with nothing
+/// starting the agent — the exec channel dies while the guest looks
+/// perfectly healthy. The unit also buys in-guest crash recovery
+/// (`Restart=always`) for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentWiring {
+    /// `/sbin/init` → symlink to `/usr/sbin/vmm-agent` (agent runs as PID 1).
+    Init,
+    /// `/etc/systemd/system/vmm-agent.service` enabled for
+    /// `multi-user.target`, with `serial-getty@ttyS0` masked.
+    SystemdUnit,
 }
 
 /// Pull an OCI image and convert it to a bootable ext4 disk image.
@@ -140,13 +159,13 @@ pub fn pull_and_convert_with_agent(
         .arg(&rootfs_dir);
     run_command(umoci, "umoci unpack")?;
 
-    // Step 2b: Inject the exec agent as init so the (initless) image can boot.
-    let agent_init = match agent_path {
-        Some(agent) => {
-            inject_agent_init(&rootfs_dir.join("rootfs"), agent)?;
-            true
-        }
-        None => false,
+    // Step 2b: Inject the exec agent. Initless images boot straight to the
+    // agent as init; systemd-bearing images get a vmm-agent.service unit so
+    // an in-guest systemd-sysv upgrade cannot brick the exec channel on the
+    // next reboot (tarit#41).
+    let agent_wiring = match agent_path {
+        Some(agent) => Some(inject_agent_init(&rootfs_dir.join("rootfs"), agent)?),
+        None => None,
     };
 
     // Step 3: Create ext4 disk image via mke2fs. umoci unpacks the root fs into
@@ -171,17 +190,16 @@ pub fn pull_and_convert_with_agent(
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     log::info!(
-        "oci: conversion complete — {} bytes in {}ms (agent_init={})",
+        "oci: conversion complete — {} bytes in {}ms (agent_wiring={agent_wiring:?})",
         size_bytes,
-        elapsed_ms,
-        agent_init
+        elapsed_ms
     );
 
     Ok(OciPullResult {
         disk_image_path: output_path.to_string_lossy().to_string(),
         size_bytes,
         elapsed_ms,
-        agent_init,
+        agent_wiring,
     })
 }
 
@@ -268,12 +286,12 @@ fn publish_disk_image(staged: &Path, destination: &Path) -> Result<(), OciError>
     Ok(())
 }
 
-/// Copy the exec agent into an unpacked rootfs and make it the init. Every
-/// path component is traversed relative to an already-open directory fd with
-/// `O_NOFOLLOW`; image-controlled symlinks cannot redirect writes onto the
-/// host. The final executable is written under a unique name and renamed over
-/// any untrusted leaf atomically.
-fn inject_agent_init(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
+/// Copy the exec agent into an unpacked rootfs and wire it up, returning how.
+/// Every path component is traversed relative to an already-open directory fd
+/// with `O_NOFOLLOW`; image-controlled symlinks cannot redirect writes onto
+/// the host. The final executable is written under a unique name and renamed
+/// over any untrusted leaf atomically.
+fn inject_agent_init(rootfs: &Path, agent: &Path) -> Result<AgentWiring, OciError> {
     #[cfg(unix)]
     {
         inject_agent_init_unix(rootfs, agent)
@@ -288,7 +306,7 @@ fn inject_agent_init(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
 }
 
 #[cfg(unix)]
-fn inject_agent_init_unix(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
+fn inject_agent_init_unix(rootfs: &Path, agent: &Path) -> Result<AgentWiring, OciError> {
     let mut root_options = OpenOptions::new();
     root_options
         .read(true)
@@ -326,8 +344,220 @@ fn inject_agent_init_unix(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
             ))
         }
     };
-    ensure_init_link_at(&init_dir)?;
-    log::info!("oci: injected exec agent as init (/usr/sbin/vmm-agent)");
+    if systemd_binary_at(&root)? {
+        mask_serial_getty_at(&root)?;
+        enable_agent_unit_at(&root)?;
+        log::info!("oci: injected exec agent as vmm-agent.service (systemd image)");
+        Ok(AgentWiring::SystemdUnit)
+    } else {
+        ensure_init_link_at(&init_dir)?;
+        log::info!("oci: injected exec agent as init (/usr/sbin/vmm-agent)");
+        Ok(AgentWiring::Init)
+    }
+}
+
+/// The systemd unit installed into systemd-bearing images, kept in lockstep
+/// with `guest/agent/bake-agent.sh` (which wires baked-from-scratch images):
+/// `Restart=always` survives agent crashes, and the conflict + mask keeps
+/// `serial-getty@ttyS0` from stealing console bytes the agent reads.
+#[cfg(unix)]
+const AGENT_UNIT_CONTENT: &str = r#"[Unit]
+Description=VMM serial exec guest agent
+Documentation=file:/usr/sbin/vmm-agent
+Conflicts=serial-getty@ttyS0.service
+After=dev-ttyS0.device
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/vmm-agent
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+"#;
+
+#[cfg(unix)]
+const SYSTEMD_BINARY_PATHS: [&[&str]; 2] = [
+    &["usr", "lib", "systemd", "systemd"],
+    &["lib", "systemd", "systemd"],
+];
+
+#[cfg(unix)]
+fn is_regular_file_at(parent: &File, name: &str) -> Result<bool, OciError> {
+    let name = c_name(name)?;
+    // SAFETY: stat is immediately initialized by fstatat before being read.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: parent fd and name are valid for the duration of fstatat.
+    let rc = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(error.into());
+    }
+    Ok(stat.st_mode & libc::S_IFMT == libc::S_IFREG)
+}
+
+/// Detect a systemd-bearing image: `usr/lib/systemd/systemd` (usr-merged
+/// layout) or `lib/systemd/systemd` (classic layout) present as a regular
+/// file. Components are walked with O_NOFOLLOW probes so an image-controlled
+/// symlink cannot redirect the detection.
+#[cfg(unix)]
+fn systemd_binary_at(root: &File) -> Result<bool, OciError> {
+    'probe: for components in SYSTEMD_BINARY_PATHS {
+        let mut dir = root.try_clone()?;
+        for (index, component) in components.iter().enumerate() {
+            if index + 1 == components.len() {
+                if is_regular_file_at(&dir, component)? {
+                    return Ok(true);
+                }
+                continue 'probe;
+            }
+            match entry_kind_at(&dir, component)? {
+                Some(EntryKind::Directory) => {
+                    dir = open_directory_at(&dir, component)?;
+                }
+                _ => continue 'probe,
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Write `bytes` as a leaf `name` under the held directory fd, atomically
+/// replacing any existing leaf: staged under a unique temporary name with
+/// O_EXCL|O_NOFOLLOW, then renamed into place (renameat replaces a leaf
+/// symlink without following it).
+#[cfg(unix)]
+fn write_leaf_at(
+    destination_dir: &File,
+    name: &str,
+    bytes: &[u8],
+    mode: libc::mode_t,
+) -> Result<(), OciError> {
+    static LEAF_SEQ: AtomicU64 = AtomicU64::new(0);
+    let sequence = LEAF_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temporary_name = format!(".{name}-{}-{sequence}.tmp", std::process::id());
+    let temporary = c_name(&temporary_name)?;
+    let destination = c_name(name)?;
+    // SAFETY: directory fd and names are valid; mode is supplied with O_CREAT.
+    let fd = unsafe {
+        libc::openat(
+            destination_dir.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fd is a fresh successful openat result and is uniquely owned.
+    let mut staged = unsafe { File::from_raw_fd(fd) };
+    let result = (|| -> Result<(), OciError> {
+        staged.write_all(bytes)?;
+        staged.flush()?;
+        staged.sync_all()?;
+        // SAFETY: staged is a valid fd and mode is a valid mode.
+        if unsafe { libc::fchmod(staged.as_raw_fd(), mode) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: both names are valid components relative to the same held
+        // directory descriptor.
+        if unsafe {
+            libc::renameat(
+                destination_dir.as_raw_fd(),
+                temporary.as_ptr(),
+                destination_dir.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        #[cfg(target_os = "linux")]
+        destination_dir.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // SAFETY: temporary is a leaf we created under the held directory.
+        unsafe { libc::unlinkat(destination_dir.as_raw_fd(), temporary.as_ptr(), 0) };
+    }
+    result
+}
+
+/// Remove a leaf under the held directory fd; a missing leaf is fine.
+#[cfg(unix)]
+fn unlink_leaf_at(dir: &File, name: &str) -> Result<(), OciError> {
+    let name = c_name(name)?;
+    // SAFETY: name is a valid component relative to the held directory fd.
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+/// Point leaf `name` at `target`, replacing whatever leaf is there (symlinkat
+/// alone fails with EEXIST on a pre-existing name).
+#[cfg(unix)]
+fn replace_symlink_at(dir: &File, name: &str, target: &[u8]) -> Result<(), OciError> {
+    unlink_leaf_at(dir, name)?;
+    let name = c_name(name)?;
+    let target =
+        std::ffi::CString::new(target).map_err(|_| OciError::UnsafePath("NUL in target".into()))?;
+    // SAFETY: target and leaf name are valid for symlinkat; the held fd
+    // confines creation to the image's directory.
+    if unsafe { libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), name.as_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    #[cfg(target_os = "linux")]
+    dir.sync_all()?;
+    Ok(())
+}
+
+/// Install and enable `vmm-agent.service` for `multi-user.target`.
+#[cfg(unix)]
+fn enable_agent_unit_at(root: &File) -> Result<(), OciError> {
+    let etc = open_or_create_directory_at(root, "etc")?;
+    let systemd = open_or_create_directory_at(&etc, "systemd")?;
+    let system = open_or_create_directory_at(&systemd, "system")?;
+    write_leaf_at(
+        &system,
+        "vmm-agent.service",
+        AGENT_UNIT_CONTENT.as_bytes(),
+        0o644,
+    )?;
+    let wants = open_or_create_directory_at(&system, "multi-user.target.wants")?;
+    replace_symlink_at(&wants, "vmm-agent.service", b"../vmm-agent.service")?;
+    Ok(())
+}
+
+/// Mask `serial-getty@ttyS0.service` (it would fight the agent over the
+/// serial console) and drop any already-enabled instance of it.
+#[cfg(unix)]
+fn mask_serial_getty_at(root: &File) -> Result<(), OciError> {
+    let etc = open_or_create_directory_at(root, "etc")?;
+    let systemd = open_or_create_directory_at(&etc, "systemd")?;
+    let system = open_or_create_directory_at(&systemd, "system")?;
+    replace_symlink_at(&system, "serial-getty@ttyS0.service", b"/dev/null")?;
+    for wants_dir in ["multi-user.target.wants", "getty.target.wants"] {
+        if let Ok(wants) = open_directory_at(&system, wants_dir) {
+            unlink_leaf_at(&wants, "serial-getty@ttyS0.service")?;
+        }
+    }
     Ok(())
 }
 
@@ -637,7 +867,8 @@ mod tests {
         std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
         let agent = test_agent(temp.path());
 
-        inject_agent_init(&rootfs, &agent).unwrap();
+        let wiring = inject_agent_init(&rootfs, &agent).unwrap();
+        assert_eq!(wiring, AgentWiring::Init);
 
         assert_eq!(
             std::fs::read(rootfs.join("usr/sbin/vmm-agent")).unwrap(),
@@ -653,6 +884,45 @@ mod tests {
             std::fs::read_link(rootfs.join("usr/sbin/init")).unwrap(),
             Path::new("/usr/sbin/vmm-agent")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_image_gets_unit_wiring_not_init_symlink() {
+        // tarit#41: an image that ships systemd must get vmm-agent.service,
+        // never the /sbin/init symlink — an in-guest systemd-sysv upgrade
+        // replaces that symlink and the next reboot silently kills the exec
+        // channel while the guest looks healthy.
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("usr/lib/systemd")).unwrap();
+        std::fs::write(rootfs.join("usr/lib/systemd/systemd"), b"#!/bin/sh\n").unwrap();
+        std::fs::create_dir(rootfs.join("sbin")).unwrap();
+        let agent = test_agent(temp.path());
+
+        let wiring = inject_agent_init(&rootfs, &agent).unwrap();
+
+        assert_eq!(wiring, AgentWiring::SystemdUnit);
+        let system = rootfs.join("etc/systemd/system");
+        let unit = std::fs::read_to_string(system.join("vmm-agent.service")).unwrap();
+        assert!(unit.contains("ExecStart=/usr/sbin/vmm-agent"));
+        assert!(unit.contains("Restart=always"));
+        assert!(unit.contains("Conflicts=serial-getty@ttyS0.service"));
+        assert_eq!(
+            std::fs::read_link(system.join("multi-user.target.wants/vmm-agent.service")).unwrap(),
+            Path::new("../vmm-agent.service")
+        );
+        assert_eq!(
+            std::fs::read_link(system.join("serial-getty@ttyS0.service")).unwrap(),
+            Path::new("/dev/null")
+        );
+        // The agent binary itself is still installed.
+        assert_eq!(
+            std::fs::read(rootfs.join("usr/sbin/vmm-agent")).unwrap(),
+            b"test-agent"
+        );
+        // And the boot-critical init symlink must NOT exist on this image.
+        assert!(std::fs::symlink_metadata(rootfs.join("sbin/init")).is_err());
     }
 
     #[cfg(unix)]
