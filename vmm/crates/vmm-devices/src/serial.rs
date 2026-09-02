@@ -42,6 +42,35 @@ impl vm_superio::Trigger for EventFdTrigger {
 
 pub struct SerialOut {
     buf: Arc<Mutex<Vec<u8>>>,
+    /// Optional echo of guest console bytes to this process's stdout.
+    ///
+    /// `None` by default. The guest console carries arbitrary workload
+    /// output — including provider API keys printed by guest commands — and
+    /// taritd inherits vmm's stdout straight into the host journald, so an
+    /// unconditional echo persists credentials in plaintext (tarit#42).
+    /// Opt in with `TARIT_SERIAL_ECHO=1` when debugging a boot
+    /// interactively; the captured ring buffer (`drain_output`) is always
+    /// filled regardless, so the exec channel does not depend on the echo.
+    echo: Option<Box<dyn Write + Send>>,
+}
+
+impl SerialOut {
+    pub fn new(buf: Arc<Mutex<Vec<u8>>>, echo: Option<Box<dyn Write + Send>>) -> Self {
+        Self { buf, echo }
+    }
+}
+
+/// Parse the `TARIT_SERIAL_ECHO` value. Split out so the (trivial) policy
+/// is unit-testable without touching process-global environment state.
+fn serial_echo_enabled_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+fn serial_echo_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        serial_echo_enabled_from_env(std::env::var("TARIT_SERIAL_ECHO").ok().as_deref())
+    })
 }
 
 impl Write for SerialOut {
@@ -54,13 +83,15 @@ impl Write for SerialOut {
                 buf.drain(0..len - MAX_OUTPUT);
             }
         }
-        io::stdout().write_all(bytes)?;
-        io::stdout().flush()?;
+        if let Some(echo) = self.echo.as_mut() {
+            let _ = echo.write_all(bytes);
+            let _ = echo.flush();
+        }
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        io::stdout().flush()
+        Ok(())
     }
 }
 
@@ -106,9 +137,12 @@ pub struct Serial {
 impl Serial {
     pub fn new(irq_evt: EventFd) -> Self {
         let out_buf = Arc::new(Mutex::new(Vec::new()));
-        let out = SerialOut {
-            buf: out_buf.clone(),
+        let echo: Option<Box<dyn Write + Send>> = if serial_echo_enabled() {
+            Some(Box::new(io::stdout()))
+        } else {
+            None
         };
+        let out = SerialOut::new(out_buf.clone(), echo);
         Self {
             inner: Mutex::new(VmSerial::new(EventFdTrigger::new(irq_evt), out)),
             out_buf,
@@ -228,6 +262,54 @@ mod tests {
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn echo_disabled_by_default_keeps_bytes_off_the_echo_sink() {
+        // tarit#42: without an echo sink there is nothing to forward, so the
+        // captured ring buffer is the only destination of guest bytes.
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut out = SerialOut::new(buf.clone(), None);
+
+        out.write_all(b"sk-supersecretkeyvalue123").unwrap();
+
+        assert_eq!(*buf.lock().unwrap(), b"sk-supersecretkeyvalue123");
+    }
+
+    #[test]
+    fn echo_enabled_forwards_guest_bytes_to_the_sink() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let mut out = SerialOut::new(buf.clone(), Some(Box::new(SharedSink(sink.clone()))));
+
+        out.write_all(b"console line").unwrap();
+
+        assert_eq!(*buf.lock().unwrap(), b"console line");
+        assert_eq!(*sink.lock().unwrap(), b"console line");
+    }
+
+    #[test]
+    fn serial_echo_env_parsing() {
+        assert!(!serial_echo_enabled_from_env(None));
+        assert!(!serial_echo_enabled_from_env(Some("")));
+        assert!(!serial_echo_enabled_from_env(Some("0")));
+        assert!(!serial_echo_enabled_from_env(Some("off")));
+        assert!(serial_echo_enabled_from_env(Some("1")));
+        assert!(serial_echo_enabled_from_env(Some("true")));
+        assert!(serial_echo_enabled_from_env(Some(" yes ")));
+    }
 
     #[test]
     fn thr_write_is_captured() {
