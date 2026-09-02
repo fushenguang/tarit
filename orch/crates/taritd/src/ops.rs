@@ -851,6 +851,7 @@ fn creating_record(
         restart_policy: spawn_cfg.restart_policy,
         egress_allowlist: None,
         egress_allow_existing: false,
+        stopped_intentionally: false,
         memory_mib: spawn_cfg.memory_mib,
         vcpus: spawn_cfg.vcpus,
         kernel_path: spawn_cfg.kernel_path.display().to_string(),
@@ -1321,6 +1322,7 @@ async fn restore_local_owned(
         restart_policy: RestartPolicy::No,
         egress_allowlist: None,
         egress_allow_existing: false,
+        stopped_intentionally: false,
         memory_mib,
         vcpus,
         kernel_path,
@@ -1493,6 +1495,15 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     tokio::task::spawn_blocking(move || sup.stop_vm(id))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+    // tarit#33: this stop is the owner's intent. Latch it before the terminal
+    // record is derived (terminal_record clones from this cache entry), so a
+    // subsequent restart_policy=unless_stopped sweep leaves the VM down, while
+    // shutdown drains and crash convergences never pass through here.
+    if let Ok(mut cache) = state.vm_cache.write() {
+        if let Some(record) = cache.get_mut(&id) {
+            record.stopped_intentionally = true;
+        }
+    }
     start_terminal_transition(state, id, VmStatus::Stopped, true)?;
     finish_terminal_transition(state, id).await
 }
@@ -1653,6 +1664,9 @@ async fn start_local_owned(
     let mut registration_record = existing.clone();
     registration_record.status = VmStatus::Creating;
     registration_record.startup_path = Some(VmStartupPath::Cold);
+    // tarit#33: a start revokes any earlier intentional stop, so an
+    // involuntary stop later on (host reboot drain) is recoverable again.
+    registration_record.stopped_intentionally = false;
     registration_record.revision = existing
         .revision
         .checked_add(1)
@@ -1836,7 +1850,12 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
         let restart = !throttled
             && vm_get(state, exit.id).is_ok_and(|record| {
                 record.status == VmStatus::Running
-                    && record.restart_policy == RestartPolicy::Always
+                    // tarit#33: unless_stopped revives here too - the vmm
+                    // died under a Running VM, which nobody stopped on purpose.
+                    && matches!(
+                        record.restart_policy,
+                        RestartPolicy::Always | RestartPolicy::UnlessStopped
+                    )
                     && record.host_id == state.config.host_id
             });
         let target_status = if restart {
@@ -1844,7 +1863,7 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
                 vm = %exit.id,
                 pid = exit.pid,
                 %exit.status,
-                "VMM exited unexpectedly; restart_policy=always, restarting"
+                "VMM exited unexpectedly; restart_policy wants a restart, restarting"
             );
             if let Ok(mut backoff) = state.restart_backoff.lock() {
                 backoff.insert(exit.id, std::time::Instant::now());
@@ -1889,7 +1908,7 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
         match start_local(state, exit.id).await {
             Ok(_) => tracing::info!(
                 vm = %exit.id,
-                "VMM exit reconciler: restarted per restart_policy=always"
+                "VMM exit reconciler: restarted per restart_policy"
             ),
             Err(error) => {
                 tracing::warn!(
@@ -3571,6 +3590,7 @@ mod tests {
                 restart_policy: RestartPolicy::No,
                 egress_allowlist: None,
                 egress_allow_existing: false,
+                stopped_intentionally: false,
                 memory_mib: 256,
                 vcpus: 1,
                 kernel_path: "kernel".into(),
@@ -3605,6 +3625,7 @@ mod tests {
             restart_policy: RestartPolicy::No,
             egress_allowlist: None,
             egress_allow_existing: false,
+            stopped_intentionally: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),

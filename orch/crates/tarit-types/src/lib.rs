@@ -86,15 +86,22 @@ impl VmStartupPath {
 /// overlay disk) after taritd starts up and finds it `Stopped` - the
 /// Docker-`--restart`-like recovery behavior from the vm-restart capability.
 ///
-/// Only `No`/`Always` are supported: `on-failure`/`unless-stopped`-style
-/// policies would need health-check infrastructure this project doesn't have
-/// yet, so they are an explicit non-goal for now.
+/// `Always` matches Docker's `restart: always`: revive on every taritd
+/// startup, **even across an explicit prior stop**. `UnlessStopped` (tarit#33)
+/// matches Docker's `restart: unless-stopped`: revive only when the VM was
+/// not stopped on purpose — an owner-initiated `POST .../stop` latches
+/// [`VmRecord::stopped_intentionally`] and the sweep skips the VM until the
+/// next successful start clears it. Involuntary stops (host shutdown drain,
+/// a crashed vmm converged by the exit reconciler) leave the flag clear, so
+/// recovery still happens. `on-failure` remains a non-goal: it would need
+/// health-check infrastructure this project doesn't have.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestartPolicy {
     #[default]
     No,
     Always,
+    UnlessStopped,
 }
 
 impl RestartPolicy {
@@ -102,6 +109,7 @@ impl RestartPolicy {
         match self {
             Self::No => "no",
             Self::Always => "always",
+            Self::UnlessStopped => "unless_stopped",
         }
     }
 
@@ -109,6 +117,7 @@ impl RestartPolicy {
         match s {
             "no" => Some(Self::No),
             "always" => Some(Self::Always),
+            "unless_stopped" | "unless-stopped" => Some(Self::UnlessStopped),
             _ => None,
         }
     }
@@ -137,6 +146,14 @@ pub struct VmRecord {
     /// field.
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// Latched by an owner-initiated stop and cleared by the next successful
+    /// start. Only `restart_policy = unless_stopped` consults it: the
+    /// startup sweep skips such a VM until it is started on purpose, while
+    /// involuntary stops (host shutdown drain, a crashed vmm) leave it clear
+    /// and recovery still happens (tarit#33). Not surfaced in public API
+    /// responses; a plain `stop` of an `always` VM intentionally ignores it.
+    #[serde(default)]
+    pub stopped_intentionally: bool,
     /// Guest egress allowlist last configured via `PATCH /v1/egress/vm/{id}`,
     /// kept independent of the tap/slot lifecycle in `net.rs` so a cold start
     /// can reapply it instead of resetting to a fresh-allocation default
@@ -613,6 +630,26 @@ impl OrchError {
 
 #[cfg(test)]
 mod tests {
+    use super::RestartPolicy;
+
+    #[test]
+    fn restart_policy_unless_stopped_round_trips() {
+        // tarit#33: wire format is snake_case (serde) but the parser also
+        // accepts Docker's hyphenated spelling so operators can copy
+        // `--restart unless-stopped` habits into fleet.db rows.
+        assert_eq!(RestartPolicy::UnlessStopped.as_str(), "unless_stopped");
+        assert_eq!(
+            RestartPolicy::parse("unless_stopped"),
+            Some(RestartPolicy::UnlessStopped)
+        );
+        assert_eq!(
+            RestartPolicy::parse("unless-stopped"),
+            Some(RestartPolicy::UnlessStopped)
+        );
+        assert_eq!(RestartPolicy::parse("always"), Some(RestartPolicy::Always));
+        assert_eq!(RestartPolicy::parse("on-failure"), None);
+    }
+
     use super::*;
 
     #[test]
@@ -692,6 +729,7 @@ mod tests {
             restart_policy: RestartPolicy::No,
             egress_allowlist: None,
             egress_allow_existing: false,
+            stopped_intentionally: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "/srv/private/vmlinux".into(),
