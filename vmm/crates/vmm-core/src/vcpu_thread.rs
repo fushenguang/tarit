@@ -102,10 +102,11 @@ impl VcpuThread {
             // first large (mmap-backed) allocation glibc lazily reads
             // /proc/sys/vm/overcommit_memory; if that first big allocation
             // happens later in the run loop (e.g. buffering a chatty guest's
-            // serial output), the openat is rejected with SIGSYS and the vCPU
-            // thread is killed mid-boot. Forcing the read here, while syscalls
-            // are unrestricted, makes glibc cache the result so the steady-state
-            // run loop never needs openat.
+            // serial output), the openat is rejected with SIGSYS and — since
+            // the filter kills the whole process on violation (tarit#35) —
+            // the entire VMM dies mid-run. Forcing the read here, while
+            // syscalls are unrestricted, makes glibc cache the result so the
+            // steady-state run loop never needs openat.
             {
                 let mut warm = vec![0; 8 * 1024 * 1024];
                 warm[0] = 1;
@@ -132,9 +133,10 @@ impl VcpuThread {
 
             // A drop guard sets `paused`+`exited` when this scope ends — even on
             // a panic unwind — so the controller never spins in pause() on a
-            // thread that has gone away. (A seccomp SIGSYS terminates the thread
-            // without unwinding, bypassing Drop; pause() has a separate liveness
-            // probe to cover that case.)
+            // thread that has gone away. (A seccomp violation now kills the
+            // whole process — tarit#35 — so the thread-only-SIGSYS case this
+            // guard cannot cover is gone; pause()'s liveness probe below stays
+            // as a second line of defense.)
             let _exit_guard = VcpuExitGuard {
                 paused: paus.clone(),
                 exited: exited_for_thread.clone(),
@@ -294,10 +296,11 @@ impl VcpuThread {
         // Poke the vCPU thread until it pauses. The kick is re-sent every
         // tick because KVM may re-enter the guest before we observe `paused`.
         while !self.paused.load(Ordering::Relaxed) && !self.exited.load(Ordering::Relaxed) {
-            // If the vCPU thread died abruptly (a seccomp SIGSYS terminates it
-            // without running the exit guard), it can never set paused/exited.
-            // A zero-signal liveness probe lets pause() — and therefore
-            // snapshot()/stop() — abort instead of spinning forever.
+            // If the vCPU thread died abruptly without running the exit guard
+            // (historically a seccomp thread-kill; the filter now kills the
+            // whole process instead, tarit#35), it can never set
+            // paused/exited. A zero-signal liveness probe lets pause() — and
+            // therefore snapshot()/stop() — abort instead of spinning forever.
             if !self.vcpu_alive() {
                 log::warn!("vCPU thread is gone; aborting pause (guest already dead)");
                 self.exited.store(true, Ordering::Relaxed);
