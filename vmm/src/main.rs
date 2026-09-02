@@ -1361,15 +1361,21 @@ fn pull_oci(
     )
     .map_err(|e| anyhow::anyhow!("oci pull: {e}"))?;
     println!(
-        "Pulled {} → {} ({} bytes, {}ms, agent_init={})",
+        "Pulled {} → {} ({} bytes, {}ms, agent_wiring={:?})",
         oci_ref.reference,
         result.disk_image_path,
         result.size_bytes,
         result.elapsed_ms,
-        result.agent_init
+        result.agent_wiring
     );
-    if result.agent_init {
-        println!("  boot: init=/usr/sbin/vmm-agent (or default cmdline; agent runs as PID 1)");
+    match result.agent_wiring {
+        Some(vmm_core::oci::AgentWiring::Init) => {
+            println!("  boot: init=/usr/sbin/vmm-agent (agent runs as PID 1)");
+        }
+        Some(vmm_core::oci::AgentWiring::SystemdUnit) => {
+            println!("  boot: vmm-agent.service enabled via multi-user.target (systemd image)");
+        }
+        None => {}
     }
     Ok(())
 }
