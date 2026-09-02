@@ -404,8 +404,14 @@ paths:
         "503":
           description: Owning host is unhealthy, stale, or unavailable
     delete:
-      summary: Stop and remove sandbox
-      description: User keys can delete only their tenant's VMs; admin keys can delete any VM.
+      summary: Stop a sandbox, or remove it with ?force=true
+      description: >-
+        User keys can delete only their tenant's VMs; admin keys can delete any
+        VM. Without ?force=true this is equivalent to POST /v1/vms/{id}/stop:
+        the guest is stopped but the VM record and overlay disk are retained,
+        and the response carries `X-Tarit-Result: retained`. Only ?force=true
+        purges the record and overlay disk (vm-delete capability) and answers
+        `X-Tarit-Result: purged`.
       parameters:
         - name: id
           in: path
@@ -413,9 +419,16 @@ paths:
           schema:
             type: string
             format: uuid
+        - name: force
+          in: query
+          required: false
+          description: Must be exactly `true` to purge the record and overlay disk; the default retains them.
+          schema:
+            type: boolean
+            default: false
       responses:
         "204":
-          description: Stopped
+          description: Stopped — see the X-Tarit-Result header (`retained` or `purged`)
         "401":
           description: Missing or invalid API key
         "403":
