@@ -1,7 +1,9 @@
 //! seccomp-BPF profiles via `seccompiler`.
 //!
 //! Two profiles: one for vCPU threads (KVM_RUN path — needs ioctls), one for
-//! the device/event thread (epoll, read/write on tap/fd).
+//! the device/event thread (epoll, read/write on tap/fd). A syscall outside
+//! the profile's allowlist kills the whole process (not just the thread) —
+//! see the comment on the filter's mismatch action in `install`.
 
 use serde::{Deserialize, Serialize};
 
@@ -147,10 +149,11 @@ impl SeccompProfile {
 
 #[cfg(target_os = "linux")]
 impl SeccompProfile {
-    /// Install the seccomp filter for this profile.
-    /// Must be called from the thread that will be filtered.
-    pub fn install(&self) -> Result<(), String> {
-        use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
+    /// Compile this profile into a BPF program. Split from `install` so the
+    /// filter construction (including the kill-process mismatch action below)
+    /// is unit-testable without loading a filter onto the test thread.
+    fn build_filter(&self) -> Result<seccompiler::BpfProgram, String> {
+        use seccompiler::{SeccompAction, SeccompFilter};
         use std::convert::TryInto;
 
         let mut rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
@@ -161,9 +164,17 @@ impl SeccompProfile {
             rules.insert(nr, self.rules_for_syscall(name)?);
         }
 
-        let filter: BpfProgram = SeccompFilter::new(
+        let filter = SeccompFilter::new(
             rules,
-            SeccompAction::KillThread,
+            // tarit#35: a violation used to kill only the offending thread
+            // (SECCOMP_RET_KILL_THREAD). In a multithreaded VMM that is worse
+            // than dying: the killed thread releases no locks (SIGSYS does no
+            // unwinding), so every thread parked on a lock it held froze
+            // forever — a "running" vmm serving a dead guest. KillProcess
+            // instead: the policy violation still fails closed and loudly, and
+            // taritd's vmm-exit watcher (tarit#40, ~1.3s measured in
+            // production) restarts the VM per its restart_policy.
+            SeccompAction::KillProcess,
             SeccompAction::Allow,
             std::env::consts::ARCH
                 .try_into()
@@ -172,7 +183,13 @@ impl SeccompProfile {
         .map_err(|e| format!("seccomp filter: {e}"))?
         .try_into()
         .map_err(|e| format!("seccomp BPF: {e}"))?;
+        Ok(filter)
+    }
 
+    /// Install the seccomp filter for this profile.
+    /// Must be called from the thread that will be filtered.
+    pub fn install(&self) -> Result<(), String> {
+        let filter = self.build_filter()?;
         seccompiler::apply_filter(&filter).map_err(|e| format!("seccomp apply: {e}"))?;
 
         log::info!(
@@ -315,6 +332,26 @@ impl SeccompProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_profile_compiles_with_kill_process_mismatch_action() {
+        // tarit#35: the mismatch action must be KillProcess (whole-process
+        // death, picked up by taritd's vmm-exit watcher) — a thread-only
+        // kill froze the VMM with a lock held while the guest sat dead.
+        // Building all three profiles also regression-tests that every
+        // allowlisted name resolves to a syscall number on this arch.
+        for profile in [
+            SeccompProfile::vcpu(),
+            SeccompProfile::device(),
+            SeccompProfile::vsock(),
+        ] {
+            let filter = profile
+                .build_filter()
+                .unwrap_or_else(|e| panic!("{:?}: {e}", profile.kind));
+            assert!(!filter.is_empty());
+        }
+    }
 
     #[test]
     fn vcpu_profile_has_vcpu_kind() {
