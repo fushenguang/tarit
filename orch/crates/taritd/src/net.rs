@@ -38,6 +38,11 @@ const NFT_INPUT_CHAIN: &str = "vm_input";
 const NFT_INGRESS_TABLE_PREFIX: &str = "taritd_ingress_";
 const NFT_INGRESS_CHAIN: &str = "ingress";
 const TAP_PREFIX: &str = "insta";
+/// Bounds for the forwarding-path uplink probe (tarit#53): six rounds at
+/// 300ms apart means a settled answer in one retry (~0.3s) and a ~1.5s worst
+/// case while a policy-routing daemon converges on a brand-new tap subnet.
+const UPLINK_PROBE_MAX_ROUNDS: usize = 6;
+const UPLINK_PROBE_INTERVAL: Duration = Duration::from_millis(300);
 const NET_POOL_SLOTS: u32 = 1 << 14;
 const NET_STATE_VERSION: u32 = 2;
 const STALE_TAP_MIN_AGE: Duration = Duration::from_secs(30);
@@ -155,7 +160,11 @@ pub struct NetProvisioner {
     inner: Mutex<SlotAllocator>,
     network_transactions: NetworkTransactionLock,
     state_path: PathBuf,
-    uplink: String,
+    /// The egress interface guests' forwarded traffic actually takes. Mutable:
+    /// startup detects it with the host's local view, but provisioning and
+    /// recovery re-probe from a guest's forwarding view and may correct it
+    /// (tarit#53 — on policy-routing hosts the two views disagree).
+    uplink: Mutex<String>,
     /// A post-rename state-sync error leaves the on-disk ownership ambiguous.
     /// Keep all current reservations and refuse further provisioning in this
     /// process rather than risk reusing a slot after a failed free.
@@ -202,7 +211,7 @@ impl NetProvisioner {
             inner: Mutex::new(allocator),
             network_transactions: NetworkTransactionLock::default(),
             state_path,
-            uplink,
+            uplink: Mutex::new(uplink),
             fail_closed: AtomicBool::new(false),
         };
         let all_allocations = provisioner.all_allocations()?;
@@ -264,8 +273,15 @@ impl NetProvisioner {
         Ok(provisioner)
     }
 
-    pub fn uplink(&self) -> &str {
-        &self.uplink
+    pub fn uplink(&self) -> String {
+        self.uplink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_uplink(&self, uplink: String) {
+        *self.uplink.lock().unwrap_or_else(|e| e.into_inner()) = uplink;
     }
 
     /// Create a tap for a new VM: allocate a reusable slot, persist ownership,
@@ -411,17 +427,72 @@ impl NetProvisioner {
     }
 
     fn provision_host(&self, alloc: &NetAlloc, policy: &EgressPolicy) -> Result<(), OrchError> {
-        for argv in tap_provision_argv(alloc, &self.uplink) {
+        // Phase 1 — uplink-independent: create the TAP, sysctls, netdev ingress
+        // table, and the host /30. The probe below needs the tap to exist and
+        // its subnet to be routed, so it cannot run before this point.
+        for argv in tap_up_argv(alloc) {
             run_argv(&argv)?;
         }
-        self.add_nft_rule(alloc)?;
+        // tarit#53: decide the uplink from this guest's forwarding view only
+        // after the tap carries its address; every uplink-bearing rule below
+        // is then built for the interface the packets will really leave by.
+        let uplink = self.resolve_uplink_for_provision(alloc)?;
+        for argv in tap_forwarding_argv(alloc, &uplink) {
+            run_argv(&argv)?;
+        }
+        self.add_nft_rule(alloc, &uplink)?;
         self.install_egress_policy(alloc, policy)?;
         self.validate_complete_effective_policies(None)?;
         run("ip", &["link", "set", &alloc.tap, "up"])
     }
 
-    fn add_nft_rule(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
-        run_argv(&masquerade_nft_argv(alloc, &self.uplink))
+    fn add_nft_rule(&self, alloc: &NetAlloc, uplink: &str) -> Result<(), OrchError> {
+        run_argv(&masquerade_nft_argv(alloc, uplink))
+    }
+
+    /// Pick the uplink for a freshly provisioned slot. The probe reflects this
+    /// slot's forwarding path; whether its result may be *adopted* depends on
+    /// the other active slots — they already carry rules built for the current
+    /// value, and rewriting live guests' rules mid-provision is not worth the
+    /// risk window, so a drift is kept and reported instead (a taritd restart
+    /// re-probes during recovery, which rebuilds every slot under quarantine).
+    fn resolve_uplink_for_provision(&self, alloc: &NetAlloc) -> Result<String, OrchError> {
+        let others_active = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+            inner
+                .active_allocations()
+                .into_keys()
+                .any(|slot| slot != alloc.idx)
+        };
+        let current = self.uplink();
+        let probed = converged_forwarding_uplink(&alloc.tap, &alloc.guest_ip);
+        match resolve_provision_uplink(&current, others_active, probed.as_deref()) {
+            UplinkResolution::Adopted(uplink) => {
+                tracing::info!(
+                    tap = %alloc.tap,
+                    old = %current,
+                    uplink = %uplink,
+                    "net: forwarding-path probe corrected the detected uplink"
+                );
+                self.set_uplink(uplink.clone());
+                Ok(uplink)
+            }
+            UplinkResolution::Kept(uplink) => Ok(uplink),
+            UplinkResolution::KeptAfterDrift { current, probed } => {
+                tracing::warn!(
+                    tap = %alloc.tap,
+                    uplink = %current,
+                    probed = %probed,
+                    "net: forwarding-path probe disagrees with the uplink in use by other \
+                     active slots; keeping the current value (restart taritd to re-probe \
+                     all slots during recovery) or set TARIT_UPLINK to pin it"
+                );
+                Ok(current)
+            }
+        }
     }
 
     fn egress_policy_for(&self, alloc: &NetAlloc) -> Result<EgressPolicy, OrchError> {
@@ -939,13 +1010,8 @@ impl NetProvisioner {
             &["-a", "list", "chain", "ip", NFT_TABLE, NFT_INPUT_CHAIN],
         )?;
         let nat = command_stdout("nft", &["-a", "list", "chain", "ip", NFT_TABLE, NFT_CHAIN])?;
-        validate_complete_effective_security_policies(
-            &policies,
-            &self.uplink,
-            &nat,
-            &forward,
-            &input,
-        )
+        let uplink = self.uplink();
+        validate_complete_effective_security_policies(&policies, &uplink, &nat, &forward, &input)
     }
 
     fn recovery_failure_after_cleanup(
@@ -976,10 +1042,33 @@ impl NetProvisioner {
     }
 
     fn program_recovered_allocation(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
-        for argv in recovered_tap_reconcile_argv(alloc, &self.uplink) {
+        // tarit#53: a recovered TAP has existed (and been visible to any
+        // policy-routing daemon) all along, so its forwarding view is stable
+        // and authoritative — prefer it over the startup-time local-view
+        // detection, which returns the proxy TUN on mihomo/Clash hosts.
+        let uplink =
+            converged_forwarding_uplink(&alloc.tap, &alloc.guest_ip).unwrap_or_else(|| {
+                tracing::warn!(
+                    tap = %alloc.tap,
+                    uplink = self.uplink(),
+                    "net: forwarding-path probe failed during recovery; falling back to the \
+                     startup-detected uplink"
+                );
+                self.uplink()
+            });
+        if uplink != self.uplink() {
+            tracing::info!(
+                tap = %alloc.tap,
+                old = self.uplink(),
+                uplink = %uplink,
+                "net: recovery forwarding-path probe corrected the detected uplink"
+            );
+            self.set_uplink(uplink.clone());
+        }
+        for argv in recovered_tap_reconcile_argv(alloc, &uplink) {
             run_argv(&argv)?;
         }
-        self.add_nft_rule(alloc)?;
+        self.add_nft_rule(alloc, &uplink)?;
         self.install_egress_policy(alloc, &self.egress_policy_for(alloc)?)
     }
 
@@ -1781,14 +1870,15 @@ fn validate_nft_base_chain_topology_json(chain: &str, listing: &str) -> Result<(
     }
 }
 
-fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
+/// Phase-1 provisioning: create the TAP, apply its sysctls, install its
+/// netdev ingress table, and configure the host /30. Nothing here depends on
+/// the uplink — all of it must be in place before the forwarding-path uplink
+/// probe can run, since the probe needs the tap to exist and its subnet to be
+/// routed (tarit#53).
+fn tap_up_argv(alloc: &NetAlloc) -> Vec<Vec<String>> {
     let tap = tap_name(alloc.idx);
     let ingress_table = ingress_table_name(alloc.idx);
     let ingress_comment = nft_quote(&ingress_comment(alloc));
-    let guard_comment = nft_quote(&guard_comment(alloc));
-    let input_comment = nft_quote(&input_comment(alloc));
-    let interface = nft_quote(&tap);
-    let uplink = nft_quote(uplink);
     let mut argv = vec![vec![
         "ip".into(),
         "tuntap".into(),
@@ -1850,8 +1940,21 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
             "add".into(),
             format!("{}/{}", alloc.host_ip, alloc.prefix),
             "dev".into(),
-            tap.clone(),
+            tap,
         ],
+    ]);
+    argv
+}
+
+/// Phase-2 provisioning: the uplink-dependent forward/input rules for a TAP
+/// brought up by [`tap_up_argv`]. The masquerade rule is programmed separately
+/// by the caller (`masquerade_nft_argv`).
+fn tap_forwarding_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
+    let interface = nft_quote(&tap_name(alloc.idx));
+    let guard_comment = nft_quote(&guard_comment(alloc));
+    let input_comment = nft_quote(&input_comment(alloc));
+    let uplink = nft_quote(uplink);
+    vec![
         vec![
             "nft".into(),
             "add".into(),
@@ -1955,12 +2058,11 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
             "comment".into(),
             input_comment,
         ],
-    ]);
-    argv
+    ]
 }
 
 fn recovered_tap_reconcile_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
-    tap_provision_argv(alloc, uplink)
+    let mut argv = tap_up_argv(alloc)
         .into_iter()
         .filter_map(|mut argv| {
             if argv.starts_with(&["ip".into(), "tuntap".into(), "add".into()]) {
@@ -1974,7 +2076,20 @@ fn recovered_tap_reconcile_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<Strin
             }
             Some(argv)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    argv.extend(tap_forwarding_argv(alloc, uplink));
+    argv
+}
+
+/// The full phase-1 + phase-2 provisioning plan as one list. Tests only:
+/// production must keep the phases apart so the forwarding-path uplink probe
+/// can run between them (tarit#53). Keeping this view also pins the split as
+/// order-preserving.
+#[cfg(test)]
+fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
+    let mut argv = tap_up_argv(alloc);
+    argv.extend(tap_forwarding_argv(alloc, uplink));
+    argv
 }
 
 fn tap_sysctl_argv(tap: &str) -> Vec<Vec<String>> {
@@ -2066,24 +2181,134 @@ fn run_nft_allowing_existing(argv: &[String]) -> Result<(), OrchError> {
     }
 }
 
+/// Pin the uplink instead of autodetecting it — escape hatch for hosts where
+/// neither probe can be trusted (exotic policy routing, air-gapped networks,
+/// multi-uplink machines). Empty/whitespace values are ignored so the
+/// variable can be exported empty to disable a previous pin.
+fn pinned_uplink(env_value: Option<&str>) -> Option<String> {
+    let pinned = env_value?.trim();
+    (!pinned.is_empty()).then(|| pinned.to_string())
+}
+
+/// Startup-time uplink detection. This is the host's *local* view; on
+/// policy-routing hosts it can disagree with the guests' forwarding path, in
+/// which case [`forwarding_uplink_probe`] corrects it at provisioning and
+/// recovery time (tarit#53).
 fn default_uplink() -> Result<String, OrchError> {
+    if let Some(pinned) = pinned_uplink(std::env::var("TARIT_UPLINK").ok().as_deref()) {
+        return Ok(pinned);
+    }
     let out = Command::new("ip")
         .args(["route", "get", "8.8.8.8"])
         .output()
         .map_err(|e| OrchError::Internal(format!("ip route get: {e}")))?;
     let text = String::from_utf8_lossy(&out.stdout);
-    // "8.8.8.8 via 172.31.32.1 dev enp39s0 src ..." → take the token after "dev".
-    let mut it = text.split_whitespace();
-    while let Some(tok) = it.next() {
-        if tok == "dev" {
-            if let Some(dev) = it.next() {
-                return Ok(dev.to_string());
-            }
+    uplink_from_route_get(&text)
+        .ok_or_else(|| OrchError::Internal("could not detect default uplink".into()))
+}
+
+/// Probe the uplink a guest behind `tap` would actually forward through, as
+/// opposed to where the host's own traffic goes. On policy-routing hosts
+/// (mihomo/Clash TUN mode) the two differ: the host's local view resolves
+/// through the proxy TUN while the guests' forwarded packets take the
+/// physical default route, so masquerade and egress-guard rules built from
+/// the local view silently dropped all guest egress (tarit#53). The explicit
+/// guest source with `iif` evaluates exactly the forwarding path, including
+/// any proxy bypass rules the routing daemon installed for the tap's subnet.
+/// `None` when the kernel cannot resolve the flow (tap missing or not yet
+/// configured) — a plain local-view `from` probe is *not* a substitute: the
+/// kernel rejects it with "Network is unreachable" for a source address the
+/// host does not own.
+fn forwarding_uplink_probe(tap: &str, guest_ip: &str) -> Option<String> {
+    let out = Command::new("ip")
+        .args(["route", "get", "8.8.8.8", "from", guest_ip, "iif", tap])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    uplink_from_route_get(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// "8.8.8.8 via 172.31.32.1 dev enp39s0 src ..." → the token after "dev".
+/// Forwarding-path output carries extra `from`/`iif` tokens; "dev" still
+/// appears exactly once and its successor is the egress interface.
+fn uplink_from_route_get(route_get: &str) -> Option<String> {
+    let mut it = route_get.split_whitespace();
+    while let Some(token) = it.next() {
+        if token == "dev" {
+            return it.next().map(str::to_string);
         }
     }
-    Err(OrchError::Internal(
-        "could not detect default uplink".into(),
-    ))
+    None
+}
+
+/// [`forwarding_uplink_probe`] until two consecutive probes agree, bounded by
+/// [`UPLINK_PROBE_MAX_ROUNDS`]. A freshly configured tap can briefly resolve
+/// through the proxy TUN because the routing daemon picks up the new local
+/// subnet asynchronously; waiting for agreement lets that settle. Returns the
+/// last probe on exhaustion — later rounds are progressively more likely to
+/// reflect the settled state, and a caller that cannot verify has the same
+/// options it had before probing.
+fn converged_forwarding_uplink(tap: &str, guest_ip: &str) -> Option<String> {
+    converged_from_probes((0..UPLINK_PROBE_MAX_ROUNDS).map(|round| {
+        if round > 0 {
+            std::thread::sleep(UPLINK_PROBE_INTERVAL);
+        }
+        forwarding_uplink_probe(tap, guest_ip)
+    }))
+}
+
+/// The convergence core of [`converged_forwarding_uplink`], isolated so the
+/// policy is unit-testable without shelling out: two consecutive equal probes
+/// win (failed probes never count as agreement); otherwise the last probe
+/// stands.
+fn converged_from_probes<I>(probes: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<String>>,
+{
+    let mut last = None;
+    for probe in probes {
+        if let (Some(previous), Some(current)) = (&last, &probe) {
+            if previous == current {
+                return Some(current.clone());
+            }
+        }
+        last = probe;
+    }
+    last
+}
+
+/// Outcome of the per-provision uplink decision. Pure so the policy is
+/// unit-testable without a NetProvisioner or a host (tarit#53).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UplinkResolution {
+    /// No other slot is active, so the forwarding-path probe becomes the
+    /// uplink.
+    Adopted(String),
+    /// The probe failed or agrees with the current value.
+    Kept(String),
+    /// Other active slots already carry rules built for the current value and
+    /// the probe disagrees; keeping theirs avoids rewriting live guests' rules
+    /// mid-provision (a restart re-probes all slots during recovery).
+    KeptAfterDrift { current: String, probed: String },
+}
+
+fn resolve_provision_uplink(
+    current: &str,
+    others_active: bool,
+    probed: Option<&str>,
+) -> UplinkResolution {
+    match probed {
+        Some(probed) if probed != current && !others_active => {
+            UplinkResolution::Adopted(probed.to_string())
+        }
+        Some(probed) if probed != current => UplinkResolution::KeptAfterDrift {
+            current: current.to_string(),
+            probed: probed.to_string(),
+        },
+        _ => UplinkResolution::Kept(current.to_string()),
+    }
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), OrchError> {
@@ -5396,7 +5621,7 @@ esac
             inner: Mutex::new(allocator),
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
-            uplink: "eth0".into(),
+            uplink: Mutex::new("eth0".into()),
             fail_closed: AtomicBool::new(false),
         };
         let old_path = std::env::var_os("PATH");
@@ -6858,7 +7083,7 @@ esac
             inner: Mutex::new(allocator),
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
-            uplink: "eth0".into(),
+            uplink: Mutex::new("eth0".into()),
             fail_closed: AtomicBool::new(false),
         };
         let old_path = std::env::var_os("PATH");
@@ -7372,7 +7597,7 @@ esac
             inner: Mutex::new(allocator),
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
-            uplink: "eth0".into(),
+            uplink: Mutex::new("eth0".into()),
             fail_closed: AtomicBool::new(false),
         };
 
@@ -7488,7 +7713,7 @@ esac
             inner: Mutex::new(allocator),
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
-            uplink: "eth0".into(),
+            uplink: Mutex::new("eth0".into()),
             fail_closed: AtomicBool::new(false),
         };
 
@@ -7581,7 +7806,7 @@ esac
             inner: Mutex::new(SlotAllocator::empty()),
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
-            uplink: "eth0".into(),
+            uplink: Mutex::new("eth0".into()),
             fail_closed: AtomicBool::new(false),
         };
         let alloc = NetAlloc::for_slot(Uuid::new_v4(), 7).unwrap();
@@ -7694,7 +7919,7 @@ esac
             inner: Mutex::new(allocator),
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
-            uplink: "eth0".into(),
+            uplink: Mutex::new("eth0".into()),
             fail_closed: AtomicBool::new(false),
         };
 
@@ -7755,5 +7980,95 @@ esac
             "failed persistence cleanup left a generated temporary file"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pinned_uplink_requires_a_nonempty_value() {
+        assert_eq!(pinned_uplink(None), None);
+        assert_eq!(pinned_uplink(Some("")), None);
+        assert_eq!(pinned_uplink(Some("   ")), None);
+        assert_eq!(pinned_uplink(Some(" eth0 ")), Some("eth0".to_string()));
+        assert_eq!(pinned_uplink(Some("enp2s0")), Some("enp2s0".to_string()));
+    }
+
+    #[test]
+    fn uplink_from_route_get_parses_local_and_forwarding_views() {
+        // Local view: "8.8.8.8 via 172.31.32.1 dev enp39s0 src ..."
+        assert_eq!(
+            uplink_from_route_get("8.8.8.8 via 172.31.32.1 dev enp39s0 src 172.31.32.5 \n"),
+            Some("enp39s0".to_string())
+        );
+        // tarit#53 forwarding view: extra from/iif tokens precede the dev.
+        assert_eq!(
+            uplink_from_route_get(
+                "8.8.8.8 from 172.16.0.2 iif insta0 via 192.168.31.1 dev enp2s0 \n"
+            ),
+            Some("enp2s0".to_string())
+        );
+        // Policy-routed probe may name the table; "dev" still precedes it.
+        assert_eq!(
+            uplink_from_route_get("8.8.8.8 via 198.18.0.2 dev Meta table 2022 src 198.18.0.1"),
+            Some("Meta".to_string())
+        );
+        assert_eq!(
+            uplink_from_route_get("RTNETLINK answers: Network is unreachable"),
+            None
+        );
+        assert_eq!(uplink_from_route_get(""), None);
+    }
+
+    #[test]
+    fn converged_probes_settle_on_two_agreeing_rounds() {
+        use super::converged_from_probes as converge;
+        let some = |dev: &str| Some(dev.to_string());
+
+        // Immediate agreement.
+        assert_eq!(converge([some("enp2s0"), some("enp2s0")]), some("enp2s0"));
+        // A transient probe failure never counts as agreement.
+        assert_eq!(
+            converge([None, some("enp2s0"), some("enp2s0")]),
+            some("enp2s0")
+        );
+        // Drift through the proxy TUN before the routing daemon settles.
+        assert_eq!(
+            converge([some("Meta"), some("enp2s0"), some("enp2s0")]),
+            some("enp2s0")
+        );
+        // Exhausted rounds fall back to the last probe.
+        assert_eq!(
+            converge([some("Meta"), some("enp2s0"), some("Meta")]),
+            some("Meta")
+        );
+        // Repeated failures must not report agreement on None.
+        assert_eq!(converge([None, None, None]), None);
+        assert_eq!(converge(Vec::new()), None);
+    }
+
+    #[test]
+    fn provision_uplink_resolution_adopts_only_when_no_other_slot_is_active() {
+        use super::UplinkResolution::{Adopted, Kept, KeptAfterDrift};
+
+        // tarit#53: the forwarding-path probe corrects a wrong startup value
+        // when nothing else depends on the old one.
+        assert_eq!(
+            resolve_provision_uplink("Meta", false, Some("enp2s0")),
+            Adopted("enp2s0".to_string())
+        );
+        // Agreement and failed probes keep the current value either way.
+        assert_eq!(
+            resolve_provision_uplink("enp2s0", false, Some("enp2s0")),
+            Kept("enp2s0".to_string())
+        );
+        assert_eq!(
+            resolve_provision_uplink("Meta", false, None),
+            Kept("Meta".to_string())
+        );
+        assert_eq!(
+            resolve_provision_uplink("Meta", true, Some("enp2s0")),
+            KeptAfterDrift {
+                current: "Meta".to_string(),
+                probed: "enp2s0".to_string()
+            }
+        );
     }
 }
