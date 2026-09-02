@@ -1035,8 +1035,9 @@ async fn shutdown_signal() -> &'static str {
     "SIGINT"
 }
 
-/// Cold-start every locally-owned `Stopped` VM with `restart_policy = always`
-/// whose overlay disk is still present, via the same `ops::start_local` path
+/// Cold-start every locally-owned `Stopped` VM with an auto-restart policy
+/// (`always`, or `unless_stopped` when the VM was not stopped on purpose) whose
+/// overlay disk is still present, via the same `ops::start_local` path
 /// (and thus the same scheduler capacity bound) a manual `POST .../start`
 /// uses. Runs once at taritd startup, after `readopt_running_vms` has
 /// already reclaimed any VM whose vmm process survived this restart - by
@@ -1060,7 +1061,7 @@ async fn restart_policy_sweep(state: &AppState) {
     }
     tracing::info!(
         count = candidates.len(),
-        "restart_policy sweep: starting always-policy VMs left stopped"
+        "restart_policy sweep: starting auto-restart-policy VMs left stopped"
     );
     let mut started = 0usize;
     let mut failed = 0usize;
@@ -1084,8 +1085,9 @@ async fn restart_policy_sweep(state: &AppState) {
 }
 
 /// Pure selection logic for `restart_policy_sweep`, split out so the
-/// filtering criteria (this host, `Stopped`, `restart_policy = always`) are
-/// unit-testable without a real `AppState`/store/scheduler.
+/// filtering criteria (this host, `Stopped`, an auto-restart policy; for
+/// `unless_stopped`, no latched intentional stop) are unit-testable without a
+/// real `AppState`/store/scheduler.
 fn restart_policy_candidates<'a>(
     vms: impl Iterator<Item = &'a tarit_types::VmRecord>,
     host_id: &str,
@@ -1093,7 +1095,15 @@ fn restart_policy_candidates<'a>(
     vms.filter(|vm| {
         vm.host_id == host_id
             && vm.status == VmStatus::Stopped
-            && vm.restart_policy == RestartPolicy::Always
+            && match vm.restart_policy {
+                RestartPolicy::Always => true,
+                // tarit#33: Docker unless-stopped semantics - skip a VM its
+                // owner stopped on purpose; an involuntary stop (shutdown
+                // drain, a converged vmm crash) leaves the latch clear and
+                // the sweep still revives it.
+                RestartPolicy::UnlessStopped => !vm.stopped_intentionally,
+                RestartPolicy::No => false,
+            }
     })
     .map(|vm| vm.id)
     .collect()
@@ -1198,6 +1208,7 @@ mod tests {
             restart_policy,
             egress_allowlist: None,
             egress_allow_existing: false,
+            stopped_intentionally: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),
@@ -1332,6 +1343,26 @@ mod tests {
             vec![wanted.id],
             "only this host's Stopped+restart_policy=always VM must be selected"
         );
+    }
+
+    #[test]
+    fn restart_policy_candidates_honor_unless_stopped_semantics() {
+        // tarit#33: an unless_stopped VM is revived after an involuntary stop
+        // (shutdown drain / converged crash) but skipped after the owner
+        // stopped it on purpose; always keeps reviving even across an
+        // explicit stop (Docker semantics).
+        let revived = sweep_test_vm("this-host", VmStatus::Stopped, RestartPolicy::UnlessStopped);
+        let mut skipped =
+            sweep_test_vm("this-host", VmStatus::Stopped, RestartPolicy::UnlessStopped);
+        skipped.stopped_intentionally = true;
+        let mut always_after_stop =
+            sweep_test_vm("this-host", VmStatus::Stopped, RestartPolicy::Always);
+        always_after_stop.stopped_intentionally = true;
+        let vms = [revived.clone(), skipped, always_after_stop.clone()];
+
+        let candidates = restart_policy_candidates(vms.iter(), "this-host");
+
+        assert_eq!(candidates, vec![revived.id, always_after_stop.id]);
     }
 
     #[tokio::test]

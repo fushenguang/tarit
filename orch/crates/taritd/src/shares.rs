@@ -1033,6 +1033,7 @@ mod tests {
             restart_policy: RestartPolicy::No,
             egress_allowlist: None,
             egress_allow_existing: false,
+            stopped_intentionally: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),

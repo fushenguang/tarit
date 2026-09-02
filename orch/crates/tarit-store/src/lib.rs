@@ -259,6 +259,12 @@ impl Store {
         ensure_column(
             &conn,
             "vms",
+            "stopped_intentionally",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "vms",
             "egress_allow_existing",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
@@ -280,10 +286,10 @@ impl Store {
         let changed = self.conn.execute(
             "INSERT INTO vms (
               id, host_id, owner_key, api_key_id, status, revision, startup_path, restart_policy,
-              egress_allowlist, egress_allow_existing,
+              egress_allowlist, egress_allow_existing, stopped_intentionally,
               memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid, created_at,
               updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
              ON CONFLICT(id) DO UPDATE SET
                owner_key = excluded.owner_key,
                api_key_id = excluded.api_key_id,
@@ -298,6 +304,7 @@ impl Store {
                cmdline = excluded.cmdline,
                socket_path = excluded.socket_path,
                pid = excluded.pid,
+               stopped_intentionally = excluded.stopped_intentionally,
                updated_at = excluded.updated_at
              WHERE vms.host_id = excluded.host_id
                AND vms.created_at = excluded.created_at
@@ -313,6 +320,7 @@ impl Store {
                 vm.restart_policy.as_str(),
                 egress_allowlist_json,
                 vm.egress_allow_existing,
+                i64::from(vm.stopped_intentionally),
                 vm.memory_mib,
                 vm.vcpus,
                 vm.kernel_path,
@@ -350,7 +358,7 @@ impl Store {
                 "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
                         restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
                         socket_path, pid, created_at, updated_at, egress_allowlist,
-                        egress_allow_existing
+                        egress_allow_existing, stopped_intentionally
                  FROM vms WHERE id = ?1",
                 params![id.to_string()],
                 row_to_vm,
@@ -552,7 +560,7 @@ impl Store {
             "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
                     restart_policy, memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
                     socket_path, pid, created_at, updated_at, egress_allowlist,
-                    egress_allow_existing
+                    egress_allow_existing, stopped_intentionally
              FROM vms ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
@@ -639,7 +647,8 @@ impl Store {
             "UPDATE vms SET
                host_id = ?2, owner_key = ?3, api_key_id = ?4, status = ?5, revision = ?6,
                startup_path = ?7, memory_mib = ?8, vcpus = ?9, kernel_path = ?10,
-               rootfs_path = ?11, cmdline = ?12, socket_path = ?13, pid = ?14, updated_at = ?15
+               rootfs_path = ?11, cmdline = ?12, socket_path = ?13, pid = ?14,
+               stopped_intentionally = ?15, updated_at = ?16
              WHERE id = ?1 AND revision < ?6",
             params![
                 vm.id.to_string(),
@@ -656,6 +665,7 @@ impl Store {
                 vm.cmdline,
                 vm.socket_path,
                 vm.pid,
+                i64::from(vm.stopped_intentionally),
                 vm.updated_at.to_rfc3339(),
             ],
         )?;
@@ -1138,6 +1148,7 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
         restart_policy: RestartPolicy::parse(&restart_policy).unwrap_or_default(),
         egress_allowlist,
         egress_allow_existing: row.get(18)?,
+        stopped_intentionally: row.get::<_, i64>(19)? != 0,
         memory_mib: row.get(8)?,
         vcpus: row.get(9)?,
         kernel_path: row.get(10)?,
@@ -1873,6 +1884,50 @@ mod tests {
     }
 
     #[test]
+    fn vm_stopped_intentionally_round_trips_and_clears_on_update() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let vm = VmRecord {
+            id: Uuid::new_v4(),
+            host_id: "host-a".into(),
+            owner_key: Some("owner-a".into()),
+            api_key_id: None,
+            status: VmStatus::Stopped,
+            revision: 1,
+            startup_path: Some(VmStartupPath::Cold),
+            restart_policy: RestartPolicy::UnlessStopped,
+            egress_allowlist: None,
+            egress_allow_existing: false,
+            stopped_intentionally: true,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "vmlinux".into(),
+            rootfs_path: Some("rootfs.ext4".into()),
+            cmdline: "console=ttyS0".into(),
+            socket_path: Some("vm.sock".into()),
+            pid: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        store.insert_vm(&vm).unwrap();
+        assert!(
+            store.get_vm(vm.id).unwrap().stopped_intentionally,
+            "the latched intentional stop must survive insert->get"
+        );
+
+        let mut restarted = vm.clone();
+        restarted.stopped_intentionally = false;
+        restarted.status = VmStatus::Running;
+        restarted.revision = 2;
+        store.update_vm(&restarted).unwrap();
+        assert!(
+            !store.get_vm(vm.id).unwrap().stopped_intentionally,
+            "a successful start must clear the latch durably"
+        );
+    }
+
+    #[test]
     fn vm_api_key_id_round_trips() {
         let store = Store::open(":memory:").unwrap();
         let now = Utc::now();
@@ -1887,6 +1942,7 @@ mod tests {
             restart_policy: RestartPolicy::No,
             egress_allowlist: None,
             egress_allow_existing: false,
+            stopped_intentionally: false,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "vmlinux".into(),
