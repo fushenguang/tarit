@@ -1440,6 +1440,25 @@ impl VmmController {
             let quoted = command.replace('\'', "'\\''");
             let cmd = format!("\nVMM_EXEC:echo {nonce}; sh -c '{quoted}'");
 
+            // tarit#38: the guest agent reads the command line into a bounded
+            // buffer (4096 bytes in pre-#38 images) and drops longer lines
+            // without a reply, so sending one would wedge this exec until its
+            // timeout with a generic error. Refuse it up front — the vsock
+            // path has the same pre-check, so this is the single place the
+            // caller sees the actionable message.
+            if cmd.len() > crate::vsock_exec::GUEST_AGENT_LINE_LIMIT {
+                let err = format!(
+                    "command line is {} bytes incl. the VMM_EXEC wrapping, over the \
+                     guest agent's {}-byte line limit (see tarit#38); rebuild the \
+                     image with the updated agent for commands up to 1 MiB, or \
+                     split the payload into chunks",
+                    cmd.len() - 1,
+                    crate::vsock_exec::GUEST_AGENT_LINE_LIMIT
+                );
+                log::warn!("exec: {err}");
+                return Err(VmmError::Kvm(err));
+            }
+
             // The emulated UART RX FIFO holds 64 bytes; a one-shot enqueue
             // silently truncates longer commands (the un-terminated fragment
             // then splices with the next exec's bytes). Feed the FIFO as the
@@ -1489,6 +1508,17 @@ impl VmmController {
                     if line_str == nonce {
                         confirmed = true;
                         continue;
+                    }
+                    if let Some(reason) = line_str.strip_prefix("VMM_EXEC_ERROR:") {
+                        // The agent rejected the line itself (e.g. LINE_TOO_LONG
+                        // past its 1 MiB hard cap). The nonce has not echoed
+                        // back yet, so this exec's own output cannot be in
+                        // flight; at worst a stale earlier command echoing this
+                        // exact prefix is misreported as a rejection. Fail fast
+                        // instead of waiting out the timeout.
+                        let err = format!("guest agent rejected the command: {reason}");
+                        log::warn!("exec: {err}");
+                        return Err(VmmError::Kvm(err));
                     }
                     if let Some(code) = line_str.strip_prefix("VMM_EXEC_EXIT=") {
                         if !confirmed {

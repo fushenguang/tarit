@@ -36,7 +36,14 @@
  * fallback for kernels/hosts without a virtio-vsock device. */
 #define VMM_EXEC_VSOCK_PORT 1024
 #define VMM_PTY_VSOCK_PORT 1025
-#define LINE_MAX_LEN 4096
+/* Command lines are read into a buffer that grows on demand, so multi-KB
+ * payloads (e.g. chunked base64 file pushes) fit in one exec instead of
+ * being silently dropped (tarit#38). A hard cap keeps a garbage stream from
+ * growing the buffer without bound; a line past it is dropped, but reported
+ * back as VMM_EXEC_ERROR:LINE_TOO_LONG so the host fails fast instead of
+ * waiting out its exec timeout. */
+#define LINE_INIT_CAP 256U
+#define LINE_HARD_MAX (1024U * 1024U)
 #define VSOCK_RECONNECT_BACKOFF_INITIAL_US 10000U
 #define VSOCK_RECONNECT_BACKOFF_MAX_US 1000000U
 
@@ -298,7 +305,12 @@ static int open_serial(void) {
     return fd;
 }
 
-static int read_line(int fd, char *line, size_t cap, bool eof_disconnect) {
+/* Read one \n-terminated line into *line, a caller-owned heap buffer grown on
+ * demand up to LINE_HARD_MAX. Returns 0 for a complete NUL-terminated line,
+ * 1 when the line exceeded LINE_HARD_MAX (the line is dropped; the caller
+ * must report it to the host), -1 on a read error / EOF per eof_disconnect.
+ * *line / *cap are reused across calls and freed by the caller. */
+static int read_line(int fd, char **line, size_t *cap, bool eof_disconnect) {
     size_t len = 0;
     bool overflow = false;
 
@@ -324,16 +336,29 @@ static int read_line(int fd, char *line, size_t cap, bool eof_disconnect) {
             continue;
         }
         if (c == '\n') {
-            if (cap > 0) {
-                line[len] = '\0';
-            }
+            (*line)[len] = '\0';
             return overflow ? 1 : 0;
         }
-        if (len + 1 < cap) {
-            line[len++] = c;
-        } else {
-            overflow = true;
+        if (overflow) {
+            continue; /* drain the tail of a dropped line */
         }
+        if (len + 2 > *cap) {
+            if (*cap >= LINE_HARD_MAX) {
+                overflow = true;
+                continue;
+            }
+            size_t ncap = *cap * 2U;
+            char *grown = realloc(*line, ncap);
+            if (grown == NULL) {
+                /* Out of memory: treat like an overlong line rather than
+                 * dying — the next command still has a chance. */
+                overflow = true;
+                continue;
+            }
+            *line = grown;
+            *cap = ncap;
+        }
+        (*line)[len++] = c;
     }
 }
 
@@ -914,7 +939,11 @@ static void serve_pty_forever(void) {
  * no virtio-vsock device (older kernel/host), connect just keeps failing and
  * this backs off to 1 Hz while serial handles exec. */
 static void serve_vsock_forever(void) {
-    char line[LINE_MAX_LEN];
+    char *line = malloc(LINE_INIT_CAP);
+    size_t line_cap = LINE_INIT_CAP;
+    if (line == NULL) {
+        return; /* forked child: serial keeps serving exec */
+    }
     unsigned int reconnect_backoff_us = VSOCK_RECONNECT_BACKOFF_INITIAL_US;
     for (;;) {
         int fd = vsock_connect_host();
@@ -930,11 +959,17 @@ static void serve_vsock_forever(void) {
         reconnect_backoff_us = VSOCK_RECONNECT_BACKOFF_INITIAL_US;
         (void)serial_write(fd, "VMM_AGENT_READY\n", 16);
         for (;;) {
-            int rc = read_line(fd, line, sizeof(line), true);
+            int rc = read_line(fd, &line, &line_cap, true);
             if (rc < 0) {
                 break; /* peer closed (e.g. after restore) -> reconnect */
             }
-            if (rc > 0 || line[0] == '\0') {
+            if (rc > 0) {
+                /* Past LINE_HARD_MAX. Report instead of dropping silently so
+                 * the host fails fast rather than burning its exec timeout. */
+                (void)serial_write(fd, "VMM_EXEC_ERROR:LINE_TOO_LONG\n", 29);
+                continue;
+            }
+            if (line[0] == '\0') {
                 continue;
             }
             if (strncmp(line, EXEC_PREFIX, EXEC_PREFIX_LEN) == 0) {
@@ -987,12 +1022,16 @@ int main(void) {
 
     run_autostart_if_present();
 
-    char line[LINE_MAX_LEN];
+    char *line = malloc(LINE_INIT_CAP);
+    size_t line_cap = LINE_INIT_CAP;
+    if (line == NULL) {
+        return 1;
+    }
     for (;;) {
         if (is_init) {
             reap_orphans();
         }
-        int rc = read_line(serial_fd, line, sizeof(line), false);
+        int rc = read_line(serial_fd, &line, &line_cap, false);
         if (rc < 0) {
             close(serial_fd);
             sleep(1);
@@ -1002,7 +1041,13 @@ int main(void) {
             }
             continue;
         }
-        if (rc > 0 || line[0] == '\0') {
+        if (rc > 0) {
+            /* Same LINE_TOO_LONG report as the vsock loop: the serial host
+             * side recognizes the marker and fails the exec immediately. */
+            (void)serial_write(serial_fd, "VMM_EXEC_ERROR:LINE_TOO_LONG\n", 29);
+            continue;
+        }
+        if (line[0] == '\0') {
             continue;
         }
         if (strncmp(line, EXEC_PREFIX, EXEC_PREFIX_LEN) == 0) {
